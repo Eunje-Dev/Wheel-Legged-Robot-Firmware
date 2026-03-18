@@ -1,7 +1,6 @@
 "./Core/Src/dma.o"
 "./Core/Src/dxl_2_0.o"
 "./Core/Src/gpio.o"
-"./Core/Src/imu_driver.o"
 "./Core/Src/main.o"
 "./Core/Src/stm32h7xx_hal_msp.o"
 "./Core/Src/stm32h7xx_it.o"

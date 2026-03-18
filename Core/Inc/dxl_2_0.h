@@ -1,51 +1,146 @@
-// 휠-레그 로봇 12축 모터 통합 제어 드라이버
-// MX-106(고관절), MX-64(무릎), AX-12(바퀴) 혼합 제어 지원
+/*
+ * dxl_2_0.h
+ * 설명: 휠-레그 로봇 구동을 위한 다이나믹셀 1.0(AX) & 2.0(MX) 통합 헤더
+ * 수정: 프로토콜 버전별 제어 주소(Control Table) 및 데이터 구조체 명세 정리
+ */
 
 #ifndef INC_DXL_2_0_H_
 #define INC_DXL_2_0_H_
 
 #include "main.h"
 
-// 로봇 시스템 관련 설정값
-#define LEG_COUNT 4      // 다리 개수
-#define MX_DATA_LEN 4    // MX 시리즈 목표 위치 데이터 길이 (4바이트)
-#define AX_DATA_LEN 2    // AX 시리즈 목표 속도 데이터 길이 (2바이트)
+// UART 송신 상태 플래그 (비동기 처리용)
+extern volatile uint8_t uart_tx_busy;
 
-// 다이나믹셀 프로토콜 2.0 주소 (MX-106, MX-64 관절용)
+#define leg_count 4		// 로봇 다리 개수 (4족 로봇)
+#define DXL_SYNC_PARAMS 64
+
+// 다이나믹셀 공통 명령어 (Instruction) 정의
+enum DxlInst {
+	DXL_INST_PING = 0x01,
+	DXL_INST_READ = 0x02,
+	DXL_INST_WRITE = 0x03,
+	DXL_INST_REG_WRITE = 0x04,
+	DXL_INST_ACTION = 0x05,
+	DXL_INST_FACTORY_RESET = 0x06,
+	DXL_INST_REBOOT = 0x08,
+	DXL_INST_CLEAR = 0x10,
+	DXL_INST_STATUS = 0x55,
+	DXL_INST_SYNC_READ = 0x82,
+	DXL_INST_SYNC_WRITE = 0x83,
+	DXL_INST_BULK_READ = 0x92,
+	DXL_INST_BULK_WRITE = 0x93,
+};
+
+// [Protocol 2.0] MX-106, MX-64 컨트롤 테이블 (다리 관절용)
+// 통신: UART6 (2Mbps)
 enum Dxl_2_0_Addr {
-    DXL_2_Torque_Enable = 64,   // 토크 온/오프 (1: 사용, 0: 해제)
-    DXL_2_LED           = 65,   // LED 제어
-    DXL_2_Goal_Position = 116,  // 목표 위치 제어 (0 ~ 4095)
+	DXL_2_Torque_Enable = 64,      // 토크 ON/OFF (1: ON, 0: OFF)
+	DXL_2_LED = 65,                // LED 제어
+	DXL_2_Status_Return_Level = 68,                // 응답레벨
+	DXL_2_Goal_PWM = 100,          // 목표 PWM 값
+	DXL_2_Goal_Velocity = 112,     // 목표 속도 (Velocity Control Mode)
+	DXL_2_Goal_Position = 116,     // 목표 위치 (Position Control Mode)
+	DXL_2_Present_Current = 126,   // 현재 소모 전류
+	DXL_2_Present_Position = 132,  // 현재 위치 (Encoder 값)
+	DXL_2_Present_Temperature = 146, // 현재 내부 온도
 };
 
-// 다이나믹셀 프로토콜 1.0 주소 (AX-12 바퀴용)
+// [Protocol 1.0] AX-12A 컨트롤 테이블 (바퀴 구동용)
+// 통신: UART3 (1Mbps)
 enum Dxl_1_0_Addr {
-    DXL_1_Torque_Enable = 24,   // 토크 온/오프
-    DXL_1_LED           = 25,   // LED 제어
-    DXL_1_Goal_Position = 30,   // 위치 제어 시 사용
-    DXL_1_MOVING_SPEED  = 32,   // 바퀴 모드 속도 제어 (0~1023: CCW, 1024~2047: CW)
+	DXL_1_Torque_Enable = 24,      // 토크 ON/OFF
+	DXL_1_LED = 25,                // LED 제어
+	DXL_1_MOVING_SPEED = 32,       // 목표 속도 (Wheel Mode 시 속도 제어)
+	DXL_1_Goal_Torque_Limit = 34,  // 최대 토크 제한
+	DXL_1_Goal_Position = 30,      // 목표 위치
+	DXL_1_Present_Load = 40,       // 현재 부하율
+	DXL_1_Present_Position = 36,   // 현재 위치
+	DXL_1_Present_Temperature = 43,   // 현재 온도
 };
 
-// 다리별 모터 구성을 관리하는 구조체
+// 로봇 다리 관절 모터 ID 매핑 구조체 (Protocol 2.0, MX 계열)
+// roll : 다리 좌우 기울기 제어 (Roll 축)
+// hip  : 다리 전후 스윙 제어 (Hip 관절)
+// knee : 링크 길이 변화 및 보행 동작 제어 (Knee 관절)
 typedef struct {
-    uint8_t hip;   // 고관절 모터 ID
-    uint8_t knee;  // 무릎관절 모터 ID
-    uint8_t wheel; // 바퀴 모터 ID
+	uint8_t roll;
+	uint8_t hip;
+	uint8_t knee;
 } LegMotors;
 
-// 외부에서 참조할 전역 변수
+// 바퀴 구동 모터 ID 매핑 구조체 (Protocol 1.0, AX 계열)
+// wheel : 이동용 바퀴 모터
+typedef struct {
+	uint8_t wheel;
+} WheelMotors;
+
+// 다리 관절 모터 ID 매핑 테이블 (Protocol 2.0, MX 계열)
 extern LegMotors legs[5];
 
-// 모터 제어 및 통신 관련 함수 선언
-void dxl_torque_set(uint8_t on_hip, uint8_t on_knee, uint8_t on_wheel); // 전체 모터 토크 제어
-void DXL_Emergency_All_Off(void);                                      // 비상 정지 (모든 토크 해제)
-void send_sync_write_1_wheel(int16_t *wheel_speeds);                  // 바퀴 4개 동시 속도 제어
-void send_sync_write_2_joints(uint32_t *hip_pos, uint32_t *knee_pos); // 관절 8개 동시 위치 제어
-void dxl_write_1_0(uint8_t id, uint8_t addr, uint8_t data_len, uint16_t data); // 개별 AX-12 제어
-uint16_t clc_speed_1(int16_t wheel_speed);                            // 바퀴 속도 값 변환 함수
+// 바퀴 모터 ID 매핑 테이블 (Protocol 1.0, AX 계열)
+extern WheelMotors wheels[5];
 
-// 통신 프로토콜 무결성 검사 함수
-unsigned short update_crc(unsigned short crc_accum, unsigned char *data_blk_ptr, unsigned short data_blk_size);
+// Protocol 1.0 Sync Write 패킷 구조체 (바퀴용)
+typedef struct {
+	uint8_t header[2];
+	uint8_t id;
+	uint8_t length;
+	uint8_t inst;
+	uint8_t start_addr;
+	uint8_t data_len;
+	uint8_t params[DXL_SYNC_PARAMS];
+	uint8_t checksum;
+} dxl_sync_write_1_0;
+
+// Protocol 2.0 Sync Write 패킷 구조체 (다리용)
+typedef struct {
+	uint8_t header[3];
+	uint8_t reserved;
+	uint8_t id;
+	uint16_t length;
+	uint8_t inst;
+	uint16_t start_addr;
+	uint16_t data_len;
+	uint8_t params[DXL_SYNC_PARAMS];
+	uint16_t crc;
+} dxl_sync_write_2_0;
+
+// --- 함수 프로토타입 선언 ---
+
+// 통합 제어 함수
+void dxl_torque_set(uint8_t on_roll, uint8_t on_hip, uint8_t on_knee,
+		uint8_t on_wheel);
+void DXL_Emergency_All_Off(void); // 비상 정지 (모든 토크 해제)
+
+// 유틸리티 함수
+uint16_t clc_speed_1(int16_t wheel_speed); // AX 모터 속도값 변환
+
+// 개별 제어 함수 (Write Instruction)
+void dxl_write_1_0(uint8_t id, uint8_t addr, uint8_t data_len, uint16_t data);
+void dxl_write_2_0(uint8_t id, uint16_t addr, uint8_t data_len, uint32_t data);
+
+// 동기화 제어 함수 (Sync Write)
+void send_sync_write_1(uint16_t addr, uint16_t data_len, uint16_t *wheel_data);
+
+// 내부 연산 및 패킷 생성 함수
+unsigned short update_crc(unsigned short crc_accum, unsigned char *data_blk_ptr,
+		unsigned short data_blk_size);
 uint8_t calculate_checksum_1_0(uint8_t *data, uint16_t length);
 
-#endif
+// Protocol 1.0 Sync Write 패킷 생성 함수 (바퀴 모터용)
+dxl_sync_write_1_0 creat_sync_packet_1_0(void);
+
+// Protocol 2.0 Sync Write 1바이트 (여러 모터 동시 제어)
+void dxl_sync_write_1byte(uint8_t *ids, uint8_t *values, uint8_t count,
+		uint16_t addr);
+
+// Protocol 2.0 Sync Write 4바이트 (여러 모터 동시 제어)
+void dxl_sync_write_4byte(uint8_t *ids, uint32_t *values, uint8_t count,
+		uint16_t addr);
+
+// Dynamixel 패킷 UART 전송 함수 (UART6 다리 모터, UART3 바퀴 모터)
+void uart_transmit_packet(UART_HandleTypeDef *huart, uint8_t *data,
+		uint16_t size);
+
+#endif /* INC_DXL_2_0_H_ */

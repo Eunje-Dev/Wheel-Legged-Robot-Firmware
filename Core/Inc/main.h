@@ -59,8 +59,10 @@ void Error_Handler(void);
 /* Private defines -----------------------------------------------------------*/
 #define DXL_RS485_EN2_Pin GPIO_PIN_4
 #define DXL_RS485_EN2_GPIO_Port GPIOA
-#define DXL_RS485_EN3_Pin GPIO_PIN_12
-#define DXL_RS485_EN3_GPIO_Port GPIOB
+#define DXL_TX_EN3_Pin GPIO_PIN_12
+#define DXL_TX_EN3_GPIO_Port GPIOB
+#define DXL_TX_EN6_Pin GPIO_PIN_8
+#define DXL_TX_EN6_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
 
