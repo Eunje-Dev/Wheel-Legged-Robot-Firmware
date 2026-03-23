@@ -47,9 +47,6 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(DXL_RS485_EN2_GPIO_Port, DXL_RS485_EN2_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(DXL_TX_EN3_GPIO_Port, DXL_TX_EN3_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
@@ -60,13 +57,6 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : DXL_RS485_EN2_Pin */
-  GPIO_InitStruct.Pin = DXL_RS485_EN2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  HAL_GPIO_Init(DXL_RS485_EN2_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : DXL_TX_EN3_Pin */
   GPIO_InitStruct.Pin = DXL_TX_EN3_Pin;

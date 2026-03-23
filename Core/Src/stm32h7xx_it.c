@@ -22,6 +22,7 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "imu_driver.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -238,6 +239,8 @@ void USART2_IRQHandler(void)
 	// UART IDLE 플래그가 세트되어 있을 때만 IMU 콜백 함수 호출
 		if(__HAL_UART_GET_FLAG(&huart2, UART_FLAG_IDLE))
 		{
+			__HAL_UART_CLEAR_IDLEFLAG(&huart2);
+			IMU_IDLE_Callback();
 		}
   /* USER CODE END USART2_IRQn 0 */
   HAL_UART_IRQHandler(&huart2);
