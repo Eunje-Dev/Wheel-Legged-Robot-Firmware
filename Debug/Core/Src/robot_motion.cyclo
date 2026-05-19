@@ -1,0 +1,12 @@
+../Core/Src/robot_motion.c:19:6:Robot_Motion_Init	1
+../Core/Src/robot_motion.c:23:6:Robot_Wheel_Stop	1
+../Core/Src/robot_motion.c:30:13:Robot_AX_Wheel_Mode_Setup	3
+../Core/Src/robot_motion.c:58:6:Robot_Wheel_Forward	1
+../Core/Src/robot_motion.c:72:6:Robot_Wheel_Backward	1
+../Core/Src/robot_motion.c:86:6:Robot_Tank_Left	1
+../Core/Src/robot_motion.c:100:6:Robot_Tank_Right	1
+../Core/Src/robot_motion.c:114:6:Robot_Set_Wheel_Mode	1
+../Core/Src/robot_motion.c:124:6:Robot_Set_Leg_Mode	1
+../Core/Src/robot_motion.c:131:6:Robot_Set_Wheel_Pose	1
+../Core/Src/robot_motion.c:168:13:Robot_Wheel_Backward_Assist	3
+../Core/Src/robot_motion.c:195:6:Robot_Set_Leg_Pose	1

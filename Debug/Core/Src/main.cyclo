@@ -1,5 +1,5 @@
-../Core/Src/main.c:70:5:main	2
-../Core/Src/main.c:139:6:SystemClock_Config	4
-../Core/Src/main.c:192:6:IMU_Task	2
-../Core/Src/main.c:201:6:Motor_Test_Task	10
-../Core/Src/main.c:261:6:Error_Handler	1
+../Core/Src/main.c:71:5:main	4
+../Core/Src/main.c:150:6:SystemClock_Config	4
+../Core/Src/main.c:205:6:IMU_Task	2
+../Core/Src/main.c:215:6:HAL_GPIO_EXTI_Callback	2
+../Core/Src/main.c:227:6:Error_Handler	1

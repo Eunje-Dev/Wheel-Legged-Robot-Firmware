@@ -1,6 +1,6 @@
 // dxl_2_0.c
-// Dynamixel Protocol 1.0(AX/UART3) + Protocol 2.0(MX/UART6) 제어 드라이버
-// UART3 : 바퀴(AX) / UART6 : 다리(MX)
+// Dynamixel Protocol 1.0(AX/UART1) + Protocol 2.0(MX/UART6) 제어 드라이버
+// UART1 : 바퀴(AX) / UART3 : Jetson VCP / UART6 : 다리(MX)
 
 #include "main.h"
 #include "dxl_2_0.h"
@@ -15,14 +15,19 @@ volatile uint8_t uart_tx_busy = 0;
 static uint8_t dxl_tx_buffer[256];
 
 // 메인 루프에서 정의된 UART 핸들 참조
-extern UART_HandleTypeDef huart3; // 바퀴(AX, 1Mbps) 제어용
+extern UART_HandleTypeDef huart1; // 바퀴(AX, 1Mbps) 제어용
+extern UART_HandleTypeDef huart3; // Jetson VCP 통신용
 extern UART_HandleTypeDef huart6; // 다리(MX, 2Mbps) 제어용
 
 // 다리별 관절 모터 ID 매핑 (Protocol 2.0, MX 계열)
+// 1: Front Left, 2: Front Right, 3: Rear Left, 4: Rear Right
+// 끝자리 1: HIP(ROLL, MX-64T), 끝자리 2: HIP(PITCH, MX-106T), 끝자리 3: KNEE(MX-64T)
 LegMotors legs[5] = { { 0, 0, 0 }, { 1, 2, 3 }, { 11, 12, 13 }, { 21, 22, 23 },
 		{ 31, 32, 33 } };
 
 // 바퀴 모터 ID 매핑 (Protocol 1.0, AX 계열)
+// 1: Front Left, 2: Front Right, 3: Rear Left, 4: Rear Right
+// 끝자리 4: WHEEL(AX-12A)
 WheelMotors wheels[5] = { { 0 }, { 4 }, { 14 }, { 24 }, { 34 } };
 
 // CRC 테이블 (Protocol 2.0용)
@@ -85,7 +90,7 @@ dxl_sync_write_1_0 creat_sync_packet_1_0(void) {
 	return sw1;
 }
 
-// UART 패킷 전송 및 TX Enable 제어 (USART3/USART6 분기)
+// UART 패킷 전송 및 TX Enable 제어 (USART1/USART6 분기)
 void uart_transmit_packet(UART_HandleTypeDef *huart, uint8_t *data,
 		uint16_t size) {
 
@@ -93,9 +98,9 @@ void uart_transmit_packet(UART_HandleTypeDef *huart, uint8_t *data,
 	// TX 전송 시 EN=HIGH, 전송 완료 후 EN=LOW
 
 	// 1) TX Enable
-	if (huart->Instance == USART3) {
+	if (huart->Instance == USART1) {
 		// 바퀴용 (AX 시리즈)
-		HAL_GPIO_WritePin(DXL_TX_EN3_GPIO_Port, DXL_TX_EN3_Pin, GPIO_PIN_SET);
+		HAL_GPIO_WritePin(DXL_TX_EN1_GPIO_Port, DXL_TX_EN1_Pin, GPIO_PIN_SET);
 	} else if (huart->Instance == USART6) {
 		// 다리용 (MX 시리즈)
 		HAL_GPIO_WritePin(DXL_TX_EN6_GPIO_Port, DXL_TX_EN6_Pin, GPIO_PIN_SET);
@@ -113,15 +118,15 @@ void uart_transmit_packet(UART_HandleTypeDef *huart, uint8_t *data,
 	}
 
 	// 4) TX Disable (버스 반환)
-	if (huart->Instance == USART3) {
-		HAL_GPIO_WritePin(DXL_TX_EN3_GPIO_Port, DXL_TX_EN3_Pin, GPIO_PIN_RESET);
+	if (huart->Instance == USART1) {
+		HAL_GPIO_WritePin(DXL_TX_EN1_GPIO_Port, DXL_TX_EN1_Pin, GPIO_PIN_RESET);
 	} else if (huart->Instance == USART6) {
 		HAL_GPIO_WritePin(DXL_TX_EN6_GPIO_Port, DXL_TX_EN6_Pin, GPIO_PIN_RESET);
 	}
 }
 
-// Sync Write 전송 - Protocol 1.0 (바퀴 제어용, UART3 유지)
-void send_sync_write_1(uint16_t addr, uint16_t data_len, uint16_t *wheel_data) {
+// Sync Write 전송 - Protocol 1.0 (바퀴 제어용, UART1 유지)
+void send_sync_write_1(uint16_t addr, uint16_t data_len, int16_t *wheel_data) {
 	uint8_t id_count = 4;
 	uint8_t id[4];
 	uint16_t data_array[4];
@@ -155,23 +160,23 @@ void send_sync_write_1(uint16_t addr, uint16_t data_len, uint16_t *wheel_data) {
 	sw1.checksum = calculate_checksum_1_0(dxl_tx_buffer, index);
 	dxl_tx_buffer[index++] = sw1.checksum;
 
-	// 바퀴는 UART3으로 전송
-	uart_transmit_packet(&huart3, dxl_tx_buffer, index);
+	// 바퀴는 UART1으로 전송
+	uart_transmit_packet(&huart1, dxl_tx_buffer, index);
 }
 
 // 전체 모터 토크 제어 (통합 인터페이스)
-void dxl_torque_set(uint8_t on_roll, uint8_t on_hip, uint8_t on_knee,
+void dxl_torque_set(uint8_t on_roll, uint8_t on_pitch, uint8_t on_knee,
 		uint8_t on_wheel) {
 	uint8_t leg_ids[12];
 	uint8_t leg_torque[12];
-	uint16_t wheel_t[4] = { on_wheel, on_wheel, on_wheel, on_wheel };
+	int16_t wheel_t[4] = { on_wheel, on_wheel, on_wheel, on_wheel };
 
 	for (int i = 1; i <= 4; i++) {
 		leg_ids[3 * (i - 1)] = legs[i].roll;
 		leg_torque[3 * (i - 1)] = on_roll;
 
-		leg_ids[3 * (i - 1) + 1] = legs[i].hip;
-		leg_torque[3 * (i - 1) + 1] = on_hip;
+		leg_ids[3 * (i - 1) + 1] = legs[i].pitch;
+		leg_torque[3 * (i - 1) + 1] = on_pitch;
 
 		leg_ids[3 * (i - 1) + 2] = legs[i].knee;
 		leg_torque[3 * (i - 1) + 2] = on_knee;
@@ -185,7 +190,7 @@ void dxl_torque_set(uint8_t on_roll, uint8_t on_hip, uint8_t on_knee,
 		__NOP();
 	}
 
-	// 바퀴 모터 (AX, UART3) 토크 설정
+	// 바퀴 모터 (AX, UART1) 토크 설정
 	send_sync_write_1(DXL_1_Torque_Enable, 1, wheel_t);
 }
 
@@ -203,7 +208,7 @@ uint16_t clc_speed_1(int16_t wheel_speed) {
 	return (uint16_t) wheel_speed;
 }
 
-// Protocol 1.0 개별 Write (바퀴용, UART3 유지)
+// Protocol 1.0 개별 Write (바퀴용, UART1 유지)
 void dxl_write_1_0(uint8_t id, uint8_t addr, uint8_t data_len, uint16_t data) {
 	uint8_t idx = 0;
 	dxl_tx_buffer[idx++] = 0xFF;
@@ -224,7 +229,7 @@ void dxl_write_1_0(uint8_t id, uint8_t addr, uint8_t data_len, uint16_t data) {
 	dxl_tx_buffer[idx] = calculate_checksum_1_0(dxl_tx_buffer, idx);
 	idx++;
 
-	uart_transmit_packet(&huart3, dxl_tx_buffer, idx);
+	uart_transmit_packet(&huart1, dxl_tx_buffer, idx);
 }
 
 // Protocol 2.0 개별 Write (다리용, UART6로 변경)

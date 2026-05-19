@@ -56,8 +56,8 @@
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
-extern DMA_HandleTypeDef hdma_usart2_tx;
 extern DMA_HandleTypeDef hdma_usart2_rx;
+extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
 extern UART_HandleTypeDef huart3;
 extern UART_HandleTypeDef huart6;
@@ -210,24 +210,24 @@ void DMA1_Stream0_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Stream0_IRQn 0 */
 
   /* USER CODE END DMA1_Stream0_IRQn 0 */
-  HAL_DMA_IRQHandler(&hdma_usart2_tx);
+  HAL_DMA_IRQHandler(&hdma_usart2_rx);
   /* USER CODE BEGIN DMA1_Stream0_IRQn 1 */
 
   /* USER CODE END DMA1_Stream0_IRQn 1 */
 }
 
 /**
-  * @brief This function handles DMA1 stream2 global interrupt.
+  * @brief This function handles USART1 global interrupt.
   */
-void DMA1_Stream2_IRQHandler(void)
+void USART1_IRQHandler(void)
 {
-  /* USER CODE BEGIN DMA1_Stream2_IRQn 0 */
+  /* USER CODE BEGIN USART1_IRQn 0 */
 
-  /* USER CODE END DMA1_Stream2_IRQn 0 */
-  HAL_DMA_IRQHandler(&hdma_usart2_rx);
-  /* USER CODE BEGIN DMA1_Stream2_IRQn 1 */
+  /* USER CODE END USART1_IRQn 0 */
+  HAL_UART_IRQHandler(&huart1);
+  /* USER CODE BEGIN USART1_IRQn 1 */
 
-  /* USER CODE END DMA1_Stream2_IRQn 1 */
+  /* USER CODE END USART1_IRQn 1 */
 }
 
 /**
@@ -236,12 +236,10 @@ void DMA1_Stream2_IRQHandler(void)
 void USART2_IRQHandler(void)
 {
   /* USER CODE BEGIN USART2_IRQn 0 */
-	// UART IDLE 플래그가 세트되어 있을 때만 IMU 콜백 함수 호출
-		if(__HAL_UART_GET_FLAG(&huart2, UART_FLAG_IDLE))
-		{
-			__HAL_UART_CLEAR_IDLEFLAG(&huart2);
-			IMU_IDLE_Callback();
-		}
+	if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_IDLE) != RESET) {
+		__HAL_UART_CLEAR_IDLEFLAG(&huart2);
+		IMU_IDLE_Callback();
+	}
   /* USER CODE END USART2_IRQn 0 */
   HAL_UART_IRQHandler(&huart2);
   /* USER CODE BEGIN USART2_IRQn 1 */
@@ -292,14 +290,5 @@ void USART6_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
-#include "dxl_2_0.h" // 모터 제어 함수 사용을 위한 헤더 포함
 
-// 하드웨어 인터럽트 발생 시 자동으로 호출되는 콜백 함수
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-	// PC13 버튼(B1) 인터럽트 신호인지 확인
-	if (GPIO_Pin == GPIO_PIN_13) {
-		// 12개 모터 전력 즉시 차단 (비상 정지)
-		DXL_Emergency_All_Off();
-	}
-}
 /* USER CODE END 1 */

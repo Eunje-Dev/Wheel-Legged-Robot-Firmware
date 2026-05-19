@@ -57,14 +57,10 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define IMU_UART_TX_Pin GPIO_PIN_2
-#define IMU_UART_TX_GPIO_Port GPIOA
-#define IMU_UART_RX_Pin GPIO_PIN_3
-#define IMU_UART_RX_GPIO_Port GPIOA
-#define DXL_TX_EN3_Pin GPIO_PIN_12
-#define DXL_TX_EN3_GPIO_Port GPIOB
 #define DXL_TX_EN6_Pin GPIO_PIN_8
 #define DXL_TX_EN6_GPIO_Port GPIOC
+#define DXL_TX_EN1_Pin GPIO_PIN_8
+#define DXL_TX_EN1_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
