@@ -1,3 +1,5 @@
-../Core/Src/jetson_comm.c:23:6:Jetson_Comm_Init	16	static
-../Core/Src/jetson_comm.c:32:6:HAL_UART_RxCpltCallback	16	static
-../Core/Src/jetson_comm.c:53:6:Jetson_Comm_Task	8	static
+../Core/Src/jetson_comm.c:38:6:Jetson_Comm_Init	16	static
+../Core/Src/jetson_comm.c:47:6:HAL_UART_RxCpltCallback	16	static
+../Core/Src/jetson_comm.c:68:13:Jetson_Reset_Auto_Request	4	static
+../Core/Src/jetson_comm.c:75:13:Jetson_Handle_Auto_Mode_Request	32	static
+../Core/Src/jetson_comm.c:142:6:Jetson_Comm_Task	8	static

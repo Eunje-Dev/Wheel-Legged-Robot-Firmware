@@ -7,16 +7,24 @@
 #include "robot_motion.h"
 #include "dxl_2_0.h"
 
+//AX Wheel Mode 초기 설정 저장
 static uint8_t ax_wheel_mode_ready = 0;
+// 시작 자세 Mode_NONE 저장
+static volatile RobotMode_t robot_mode = MODE_NONE;
 
 extern volatile uint8_t user_stop_flag;
 
 #define WHEEL_POSE_WAIT_TIME_MS   3000
 #define LEG_PITCH_ASSIST_TIME_MS 3000
-#define LEG_KNEE_WAIT_TIME_MS    8000
+#define LEG_KNEE_WAIT_TIME_MS    5000
 
 // 로봇 동작 초기화
 void Robot_Motion_Init(void) {
+}
+
+// 로봇 현재 모드 확인
+RobotMode_t Robot_Get_Mode(void) {
+	return robot_mode;
 }
 
 // AX 바퀴 정지
@@ -56,6 +64,11 @@ static void Robot_AX_Wheel_Mode_Setup(void) {
 
 // Wheel Mode 전진
 void Robot_Wheel_Forward(void) {
+	if (robot_mode != MODE_WHEEL) {
+		Robot_Wheel_Stop();
+		return;
+	}
+
 	const int16_t wheel_speed = 450;
 
 	int16_t wheel_data[4] = { wheel_speed,   // ID 4  : 정면 기준 왼쪽 회전
@@ -70,6 +83,11 @@ void Robot_Wheel_Forward(void) {
 
 // Wheel Mode 후진
 void Robot_Wheel_Backward(void) {
+	if (robot_mode != MODE_WHEEL) {
+		Robot_Wheel_Stop();
+		return;
+	}
+
 	const int16_t wheel_speed = 450;
 
 	int16_t wheel_data[4] = { -wheel_speed,  // ID 4  : 정면 기준 오른쪽 회전
@@ -84,6 +102,11 @@ void Robot_Wheel_Backward(void) {
 
 // 좌회전 탱크턴
 void Robot_Tank_Left(void) {
+	if (robot_mode != MODE_WHEEL) {
+		Robot_Wheel_Stop();
+		return;
+	}
+
 	const int16_t wheel_speed = 450;
 
 	int16_t wheel_data[4] = { -wheel_speed,  // ID 4  : 정면 기준 오른쪽 회전
@@ -98,6 +121,11 @@ void Robot_Tank_Left(void) {
 
 // 우회전 탱크턴
 void Robot_Tank_Right(void) {
+	if (robot_mode != MODE_WHEEL) {
+		Robot_Wheel_Stop();
+		return;
+	}
+
 	const int16_t wheel_speed = 450;
 
 	int16_t wheel_data[4] = { wheel_speed,  // ID 4  : 정면 기준 왼쪽 회전
@@ -112,18 +140,42 @@ void Robot_Tank_Right(void) {
 
 // Wheel Mode 전환
 void Robot_Set_Wheel_Mode(void) {
+	if (robot_mode == MODE_WHEEL || robot_mode == MODE_TO_WHEEL) {
+		return;
+	}
+
+	if (robot_mode == MODE_TO_LEG) {
+		return;
+	}
+
+	robot_mode = MODE_TO_WHEEL;
+
 	Robot_AX_Wheel_Mode_Setup();
 	Robot_Wheel_Stop();
 
 	Robot_Set_Wheel_Pose();
 
 	Robot_Wheel_Stop();
+
+	robot_mode = MODE_WHEEL;
 }
 
 // Leg Mode 전환
 void Robot_Set_Leg_Mode(void) {
+	if (robot_mode == MODE_LEG || robot_mode == MODE_TO_LEG) {
+		return;
+	}
+
+	if (robot_mode == MODE_TO_WHEEL) {
+		return;
+	}
+
+	robot_mode = MODE_TO_LEG;
+
 	Robot_Wheel_Stop();
 	Robot_Set_Leg_Pose();
+
+	robot_mode = MODE_LEG;
 
 }
 
@@ -211,15 +263,19 @@ void Robot_Set_Leg_Pose(void) {
 			2013   // ID 33
 			};
 
-	uint32_t profile_acc[4] = { 5, 5, 5, 5 };
-	uint32_t profile_vel[4] = { 10, 10, 10, 10 };
-	uint8_t torque_on[4] = { 1, 1, 1, 1 };
+	// HIP(PITCH) 모터 속도/가속도 설정
+	uint32_t pitch_profile_acc[4] = { 5, 5, 5, 5 };
+	uint32_t pitch_profile_vel[4] = { 10, 10, 10, 10 };
+
+	// KNEE 모터 속도/가속도 설정
+	uint32_t knee_profile_acc[4] = { 5, 5, 5, 5 };
+	uint32_t knee_profile_vel[4] = { 15, 15, 15, 15 };
 
 	// HIP(PITCH) 모터 속도/가속도 설정
-	dxl_sync_write_4byte(pitch_ids, profile_acc, 4, DXL_2_Profile_Acceleration);
+	dxl_sync_write_4byte(pitch_ids, pitch_profile_acc, 4, DXL_2_Profile_Acceleration);
 	HAL_Delay(20);
 
-	dxl_sync_write_4byte(pitch_ids, profile_vel, 4, DXL_2_Profile_Velocity);
+	dxl_sync_write_4byte(pitch_ids, pitch_profile_vel, 4, DXL_2_Profile_Velocity);
 	HAL_Delay(20);
 
 	// HIP(PITCH) 토크 ON 후 목표 위치 전송
@@ -237,10 +293,10 @@ void Robot_Set_Leg_Pose(void) {
 	HAL_Delay(100);
 
 	// KNEE 모터 속도/가속도 설정
-	dxl_sync_write_4byte(knee_ids, profile_acc, 4, DXL_2_Profile_Acceleration);
+	dxl_sync_write_4byte(knee_ids, knee_profile_acc, 4, DXL_2_Profile_Acceleration);
 	HAL_Delay(20);
 
-	dxl_sync_write_4byte(knee_ids, profile_vel, 4, DXL_2_Profile_Velocity);
+	dxl_sync_write_4byte(knee_ids, knee_profile_vel, 4, DXL_2_Profile_Velocity);
 	HAL_Delay(20);
 
 	// KNEE 토크 ON 후 목표 위치 전송

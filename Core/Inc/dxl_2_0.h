@@ -55,7 +55,7 @@ enum Dxl_2_0_Addr {
 	DXL_2_Present_Temperature = 146, // 현재 내부 온도
 };
 
-// [Protocol 1.0] AX-12A 컨트롤 테이블 (바퀴 구동용)
+// [Protocol 1.0] AX-12+ 컨트롤 테이블 (바퀴 구동용)
 // 통신: UART1 (1Mbps)
 enum Dxl_1_0_Addr {
 	DXL_1_CW_Angle_Limit = 6,      // CW 각도 제한
@@ -150,7 +150,7 @@ void dxl_sync_write_1byte(uint8_t *ids, uint8_t *values, uint8_t count,
 void dxl_sync_write_4byte(uint8_t *ids, uint32_t *values, uint8_t count,
 		uint16_t addr);
 
-// Dynamixel 패킷 UART 전송 함수 (UART6 다리 모터, UART1 바퀴 모터)
+// Dynamixel 패킷 전송 함수 (USART1 바퀴, USART6 다리)
 void uart_transmit_packet(UART_HandleTypeDef *huart, uint8_t *data,
 		uint16_t size);
 

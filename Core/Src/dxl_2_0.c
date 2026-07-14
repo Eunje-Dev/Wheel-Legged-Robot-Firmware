@@ -1,6 +1,6 @@
 // dxl_2_0.c
-// Dynamixel Protocol 1.0(AX/UART1) + Protocol 2.0(MX/UART6) 제어 드라이버
-// UART1 : 바퀴(AX) / UART3 : Jetson VCP / UART6 : 다리(MX)
+// Dynamixel Protocol 1.0(AX/USART1) + Protocol 2.0(MX/USART6) 제어 드라이버
+// USART1 : 바퀴(AX) / USART3 : Jetson 통신 / USART6 : 다리(MX)
 
 #include "main.h"
 #include "dxl_2_0.h"
@@ -27,7 +27,7 @@ LegMotors legs[5] = { { 0, 0, 0 }, { 1, 2, 3 }, { 11, 12, 13 }, { 21, 22, 23 },
 
 // 바퀴 모터 ID 매핑 (Protocol 1.0, AX 계열)
 // 1: Front Left, 2: Front Right, 3: Rear Left, 4: Rear Right
-// 끝자리 4: WHEEL(AX-12A)
+// 끝자리 4: WHEEL(AX-12+)
 WheelMotors wheels[5] = { { 0 }, { 4 }, { 14 }, { 24 }, { 34 } };
 
 // CRC 테이블 (Protocol 2.0용)

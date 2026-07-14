@@ -8,6 +8,11 @@
 #ifndef INC_ROBOT_MOTION_H_
 #define INC_ROBOT_MOTION_H_
 
+// 로봇 현재 모드
+typedef enum {
+	MODE_NONE = 0, MODE_WHEEL, MODE_LEG, MODE_TO_WHEEL, MODE_TO_LEG
+} RobotMode_t;
+
 // 로봇 동작 초기화
 void Robot_Motion_Init(void);
 
@@ -37,5 +42,8 @@ void Robot_Set_Wheel_Mode(void);
 
 // Leg Mode 전환
 void Robot_Set_Leg_Mode(void);
+
+// 로봇 현재 모드 확인
+RobotMode_t Robot_Get_Mode(void);
 
 #endif /* INC_ROBOT_MOTION_H_ */
