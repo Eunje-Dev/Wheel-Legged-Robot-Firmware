@@ -9,18 +9,30 @@
 #include <string.h>
 #include <stdlib.h>
 
+// IMU DMA 수신 버퍼 크기
+#define IMU_RX_BUF_SIZE 128U
+
+// IMU 데이터 유효 시간
+#define IMU_STALE_TIMEOUT_MS 200U
+
 // UART 핸들 저장
 static UART_HandleTypeDef *imu_huart;
 
 // DMA 수신 버퍼
-static uint8_t rx_buf[128];
-static uint8_t proc_buf[128];
+static uint8_t rx_buf[IMU_RX_BUF_SIZE];
+static uint8_t proc_buf[IMU_RX_BUF_SIZE];
 
 // 현재 IMU 데이터
 static IMU_Data_t imu_data = { 0 };
 
 // 수신 완료 플래그
 static volatile uint8_t data_ready = 0;
+
+// IMU 수신 상태
+static volatile uint8_t receive_error = 0;
+static volatile uint32_t frame_timestamp_ms = 0;
+static volatile uint32_t dropped_frame_count = 0;
+static uint32_t parse_error_count = 0;
 
 // IMU 문자열 → roll/pitch/yaw 파싱
 static uint8_t IMU_Parse_Frame(const char *buf, float *roll, float *pitch,
@@ -32,24 +44,46 @@ void IMU_Init(UART_HandleTypeDef *huart) {
 }
 
 // DMA 수신 시작
-void IMU_Start_DMA(void) {
-	HAL_UART_Receive_DMA(imu_huart, rx_buf, sizeof(rx_buf));
-	__HAL_UART_ENABLE_IT(imu_huart, UART_IT_IDLE);
+HAL_StatusTypeDef IMU_Start_DMA(void) {
+	HAL_StatusTypeDef status = HAL_UARTEx_ReceiveToIdle_DMA(imu_huart, rx_buf,
+			sizeof(rx_buf));
+
+	if (status == HAL_OK) {
+		__HAL_DMA_DISABLE_IT(imu_huart->hdmarx, DMA_IT_HT);
+		receive_error = 0;
+	} else {
+		receive_error = 1;
+	}
+
+	return status;
 }
 
-// IDLE 인터럽트 콜백 (프레임 수신 완료)
-void IMU_IDLE_Callback(void) {
-	// DMA 정지
-	HAL_UART_DMAStop(imu_huart);
+// UART IDLE 수신 완료 콜백
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size) {
+	if (huart != imu_huart)
+		return;
 
-	// 수신 데이터 복사
-	memcpy(proc_buf, rx_buf, sizeof(rx_buf));
+	if (size > 0) {
+		uint16_t copy_size = size;
 
-	// 플래그 설정
-	data_ready = 1;
+		if (copy_size >= sizeof(proc_buf))
+			copy_size = sizeof(proc_buf) - 1;
+
+		if (!data_ready) {
+			// 수신 데이터 복사
+			memcpy(proc_buf, rx_buf, copy_size);
+			proc_buf[copy_size] = '\0';
+
+			// 플래그 설정
+			frame_timestamp_ms = HAL_GetTick();
+			data_ready = 1;
+		} else {
+			dropped_frame_count++;
+		}
+	}
 
 	// DMA 재시작
-	HAL_UART_Receive_DMA(imu_huart, rx_buf, sizeof(rx_buf));
+	IMU_Start_DMA();
 }
 
 // 수신 데이터 파싱
@@ -63,13 +97,19 @@ void IMU_Process_Data(void) {
 	float roll, pitch, yaw;
 
 	// 파싱 실패 시 기존 데이터 유지
-	if (!IMU_Parse_Frame((char*) proc_buf, &roll, &pitch, &yaw))
+	if (!IMU_Parse_Frame((char*) proc_buf, &roll, &pitch, &yaw)) {
+		parse_error_count++;
+		data_ready = 0;
 		return;
+	}
 
 	// 파싱 성공 시만 데이터 갱신
 	imu_data.roll = roll;
 	imu_data.pitch = pitch;
 	imu_data.yaw = yaw;
+	imu_data.timestamp_ms = frame_timestamp_ms;
+	imu_data.sequence++;
+	imu_data.valid = 1;
 	imu_data.updated = 1;
 
 	// 정상 처리 후 플래그 클리어
@@ -78,8 +118,29 @@ void IMU_Process_Data(void) {
 
 // 최신 데이터 반환
 IMU_Data_t IMU_Get_Data(void) {
+	IMU_Data_t data = imu_data;
+
 	imu_data.updated = 0;
-	return imu_data;
+
+	if (receive_error)
+		data.valid = 0;
+
+	if (data.valid
+			&& (uint32_t) (HAL_GetTick() - data.timestamp_ms)
+					> IMU_STALE_TIMEOUT_MS) {
+		data.valid = 0;
+	}
+
+	return data;
+}
+
+// IMU 데이터 오류 횟수 반환
+uint32_t IMU_Get_Parse_Error_Count(void) {
+	return parse_error_count;
+}
+
+uint32_t IMU_Get_Dropped_Frame_Count(void) {
+	return dropped_frame_count;
 }
 
 // IMU 프레임 파싱 함수
@@ -98,18 +159,26 @@ static uint8_t IMU_Parse_Frame(const char *buf, float *roll, float *pitch,
 
 	// roll 파싱
 	*roll = strtof(ptr, &endptr);
-	if (*endptr != ',')
+	if (endptr == ptr || *endptr != ',')
 		return 0;
 
 	// pitch 파싱
 	ptr = endptr + 1;
 	*pitch = strtof(ptr, &endptr);
-	if (*endptr != ',')
+	if (endptr == ptr || *endptr != ',')
 		return 0;
 
 	// yaw 파싱
 	ptr = endptr + 1;
 	*yaw = strtof(ptr, &endptr);
+	if (endptr == ptr)
+		return 0;
+
+	while (*endptr == ' ' || *endptr == '\r' || *endptr == '\n')
+		endptr++;
+
+	if (*endptr != '\0')
+		return 0;
 
 	return 1;
 }

@@ -51,6 +51,7 @@
 IMU_Data_t g_imu_data;               // 최신 IMU 데이터
 volatile uint8_t user_stop_flag = 0;   // USER 버튼 눌림 여부 (1이면 모터 정지)
 volatile uint8_t mode_button_request = 0;
+static uint8_t user_button_step = 0;	// USER 버튼 시험 동작 순서
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -99,7 +100,9 @@ int main(void) {
 	MX_USART2_UART_Init(); // IMU
 	/* USER CODE BEGIN 2 */
 	IMU_Init(&huart2);      // IMU UART 핸들 등록
-	IMU_Start_DMA();        // DMA 수신 시작
+	if (IMU_Start_DMA() != HAL_OK) { // DMA 수신 시작
+		Error_Handler();
+	}
 
 	Robot_Motion_Init(); // 로봇 동작 상태 초기화
 	Jetson_Comm_Init(&huart3); // Jetson VCP 통신 초기화
@@ -135,15 +138,41 @@ int main(void) {
 		if (mode_button_request) {
 			mode_button_request = 0;
 
-			RobotMode_t current_mode = Robot_Get_Mode();
+			switch (user_button_step) {
 
-			if (current_mode == MODE_WHEEL) {
+			case 0:
+				// 첫 번째 입력: Wheel → Leg
 				Robot_Set_Leg_Mode();
-			} else if (current_mode == MODE_LEG || current_mode == MODE_NONE) {
+				user_button_step = 1;
+				break;
+
+			case 1:
+				// 두 번째 입력: Leg → Wheel
 				Robot_Set_Wheel_Mode();
+				user_button_step = 2;
+				break;
+
+			case 2:
+				// 세 번째 입력: Wheel Mode 전진
+				if (Robot_Get_Mode() == MODE_WHEEL) {
+					Robot_Wheel_Forward();
+					user_button_step = 3;
+				}
+				break;
+
+			case 3:
+				// 네 번째 입력: 바퀴 정지 후 처음 순서로 복귀
+				Robot_Wheel_Stop();
+				user_button_step = 0;
+				break;
+
+			default:
+				Robot_Wheel_Stop();
+				user_button_step = 0;
+				break;
 			}
 
-			// 모드 전환 중 발생한 추가 버튼 입력 제거
+			// 동작 중 발생한 추가 버튼 입력 제거
 			mode_button_request = 0;
 		}
 	}
@@ -216,38 +245,45 @@ void IMU_Task(void) {
 	IMU_Data_t data = IMU_Get_Data();
 	if (data.updated) {
 		g_imu_data = data;
+	} else {
+		g_imu_data.updated = 0;
 	}
-}
 
-// USER 버튼 인터럽트 콜백
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-	static uint32_t last_button_tick = 0;
-
-	if (GPIO_Pin == GPIO_PIN_13) {
-		uint32_t current_tick = HAL_GetTick();
-
-		// 버튼 채터링 방지
-		if ((current_tick - last_button_tick) >= 300U) {
-			mode_button_request = 1;
-			last_button_tick = current_tick;
+		// IMU 데이터 수신 중단 시 유효 상태 해제
+		if (!data.valid) {
+			g_imu_data.valid = 0;
 		}
 	}
-}
 
-/* USER CODE END 4 */
+// USER 버튼 인터럽트 콜백
+	void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+		static uint32_t last_button_tick = 0;
 
-/**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void) {
-	/* USER CODE BEGIN Error_Handler_Debug */
-	/* User can add his own implementation to report the HAL error return state */
-	__disable_irq();
-	while (1) {
+		if (GPIO_Pin == GPIO_PIN_13) {
+			uint32_t current_tick = HAL_GetTick();
+
+			// 버튼 채터링 방지
+			if ((current_tick - last_button_tick) >= 300U) {
+				mode_button_request = 1;
+				last_button_tick = current_tick;
+			}
+		}
 	}
-}
-/* USER CODE END Error_Handler_Debug */
+
+	/* USER CODE END 4 */
+
+	/**
+	 * @brief  This function is executed in case of error occurrence.
+	 * @retval None
+	 */
+	void Error_Handler(void) {
+		/* USER CODE BEGIN Error_Handler_Debug */
+		/* User can add his own implementation to report the HAL error return state */
+		__disable_irq();
+		while (1) {
+		}
+	}
+	/* USER CODE END Error_Handler_Debug */
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number

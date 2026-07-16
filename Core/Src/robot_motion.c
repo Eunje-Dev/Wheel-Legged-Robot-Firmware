@@ -9,6 +9,8 @@
 
 //AX Wheel Mode 초기 설정 저장
 static uint8_t ax_wheel_mode_ready = 0;
+// 전원 인가 후 최초 Wheel 자세 전환 여부
+static uint8_t first_wheel_pose = 1;
 // 시작 자세 Mode_NONE 저장
 static volatile RobotMode_t robot_mode = MODE_NONE;
 
@@ -69,7 +71,7 @@ void Robot_Wheel_Forward(void) {
 		return;
 	}
 
-	const int16_t wheel_speed = 450;
+	const int16_t wheel_speed = 750;
 
 	int16_t wheel_data[4] = { wheel_speed,   // ID 4  : 정면 기준 왼쪽 회전
 			-wheel_speed,  // ID 14 : 정면 기준 오른쪽 회전
@@ -88,7 +90,7 @@ void Robot_Wheel_Backward(void) {
 		return;
 	}
 
-	const int16_t wheel_speed = 450;
+	const int16_t wheel_speed = 750;
 
 	int16_t wheel_data[4] = { -wheel_speed,  // ID 4  : 정면 기준 오른쪽 회전
 			wheel_speed,   // ID 14 : 정면 기준 왼쪽 회전
@@ -107,7 +109,7 @@ void Robot_Tank_Left(void) {
 		return;
 	}
 
-	const int16_t wheel_speed = 450;
+	const int16_t wheel_speed = 600;
 
 	int16_t wheel_data[4] = { -wheel_speed,  // ID 4  : 정면 기준 오른쪽 회전
 			-wheel_speed,  // ID 14 : 정면 기준 오른쪽 회전
@@ -126,7 +128,7 @@ void Robot_Tank_Right(void) {
 		return;
 	}
 
-	const int16_t wheel_speed = 450;
+	const int16_t wheel_speed = 600;
 
 	int16_t wheel_data[4] = { wheel_speed,  // ID 4  : 정면 기준 왼쪽 회전
 			wheel_speed,  // ID 14 : 정면 기준 왼쪽 회전
@@ -191,10 +193,16 @@ void Robot_Set_Wheel_Pose(void) {
 			2048, 3565, 1286   // leg4: RR
 			};
 
-	uint32_t profile_acc[12] = { 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5 };
+	uint32_t profile_acc[12];
+	uint32_t profile_vel[12];
 
-	uint32_t profile_vel[12] =
-			{ 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10 };
+	uint32_t acc_value = first_wheel_pose ? 2 : 5;
+	uint32_t vel_value = first_wheel_pose ? 5 : 10;
+
+	for (int i = 0; i < 12; i++) {
+	    profile_acc[i] = acc_value;
+	    profile_vel[i] = vel_value;
+	}
 
 	uint8_t torque_off[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
@@ -214,6 +222,9 @@ void Robot_Set_Wheel_Pose(void) {
 
 	dxl_sync_write_4byte(ids, wheel_pose, 12, DXL_2_Goal_Position);
 	HAL_Delay(WHEEL_POSE_WAIT_TIME_MS);
+
+	// 이후 Wheel 전환부터는 기존 프로파일 사용
+	first_wheel_pose = 0;
 }
 
 // LEG 전환 중 AX 바퀴 후진 보조
@@ -250,7 +261,7 @@ void Robot_Set_Leg_Pose(void) {
 
 	uint32_t pitch_pose[4] = { 3001,  // ID 2
 			2163,  // ID 12
-			4095,     // ID 22
+			4095,  // ID 22
 			3059   // ID 32
 			};
 
@@ -262,6 +273,9 @@ void Robot_Set_Leg_Pose(void) {
 			946,   // ID 23
 			2013   // ID 33
 			};
+
+	// Leg Mode에서 제어하는 4개 모터의 토크 활성화 값
+	uint8_t torque_on[4] = { 1, 1, 1, 1 };
 
 	// HIP(PITCH) 모터 속도/가속도 설정
 	uint32_t pitch_profile_acc[4] = { 5, 5, 5, 5 };
