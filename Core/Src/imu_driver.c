@@ -116,11 +116,9 @@ void IMU_Process_Data(void) {
 	data_ready = 0;
 }
 
-// 최신 데이터 반환
-IMU_Data_t IMU_Get_Data(void) {
+// 갱신 상태를 변경하지 않고 최신 데이터 반환
+IMU_Data_t IMU_Get_Latest_Data(void) {
 	IMU_Data_t data = imu_data;
-
-	imu_data.updated = 0;
 
 	if (receive_error)
 		data.valid = 0;
@@ -130,6 +128,15 @@ IMU_Data_t IMU_Get_Data(void) {
 					> IMU_STALE_TIMEOUT_MS) {
 		data.valid = 0;
 	}
+
+	return data;
+}
+
+// 최신 데이터 반환
+IMU_Data_t IMU_Get_Data(void) {
+	IMU_Data_t data = IMU_Get_Latest_Data();
+
+	imu_data.updated = 0;
 
 	return data;
 }

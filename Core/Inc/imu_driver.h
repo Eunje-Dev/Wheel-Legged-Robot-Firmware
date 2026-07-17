@@ -33,6 +33,9 @@ void IMU_Process_Data(void);
 // 최신 IMU 데이터 반환
 IMU_Data_t IMU_Get_Data(void);
 
+// 갱신 상태를 변경하지 않고 최신 IMU 데이터 반환
+IMU_Data_t IMU_Get_Latest_Data(void);
+
 // IMU 데이터 오류 횟수 반환
 uint32_t IMU_Get_Parse_Error_Count(void);
 uint32_t IMU_Get_Dropped_Frame_Count(void);
