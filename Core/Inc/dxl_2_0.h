@@ -46,11 +46,13 @@ enum Dxl_2_0_Addr {
 	DXL_2_Torque_Enable = 64,      // 토크 ON/OFF (1: ON, 0: OFF)
 	DXL_2_LED = 65,                // LED 제어
 	DXL_2_Status_Return_Level = 68, // 응답레벨
+	DXL_2_Hardware_Error_Status = 70, // 하드웨어 에러 상태
 	DXL_2_Goal_PWM = 100,          // 목표 PWM 값
 	DXL_2_Profile_Acceleration = 108, // 프로파일 가속도
 	DXL_2_Profile_Velocity = 112,  // 프로파일 속도
 	DXL_2_Goal_Position = 116,     // 목표 위치 (Position Control Mode)
 	DXL_2_Present_Current = 126,   // 현재 소모 전류
+	DXL_2_Present_Velocity = 128,  // 현재 속도
 	DXL_2_Present_Position = 132,  // 현재 위치 (Encoder 값)
 	DXL_2_Present_Temperature = 146, // 현재 내부 온도
 };
@@ -131,6 +133,40 @@ uint16_t clc_speed_1(int16_t wheel_speed); // AX 모터 속도값 변환
 void dxl_write_1_0(uint8_t id, uint8_t addr, uint8_t data_len, uint16_t data);
 void dxl_write_2_0(uint8_t id, uint16_t addr, uint8_t data_len, uint32_t data);
 
+// Protocol 2.0 Read 통신 실패 단계
+enum DxlReadFailStage {
+	DXL_READ_FAIL_NONE = 0,
+	DXL_READ_FAIL_ARGUMENT = 1,
+	DXL_READ_FAIL_HEADER_RX = 2,
+	DXL_READ_FAIL_HEADER = 3,
+	DXL_READ_FAIL_LENGTH = 4,
+	DXL_READ_FAIL_BODY_RX = 5,
+	DXL_READ_FAIL_CRC = 6,
+	DXL_READ_FAIL_STATUS = 7,
+	DXL_READ_FAIL_DATA = 8,
+	DXL_READ_FAIL_HEADER_RX_TIMEOUT_BASE = 20, // 20~26: 수신 바이트 수 0~6
+	DXL_READ_FAIL_HEADER_RX_ERROR = 28,
+	DXL_READ_FAIL_HEADER_RX_BUSY = 29,
+	DXL_READ_FAIL_DIRECTION = 30,
+	DXL_READ_FAIL_RECEIVER = 31,
+	DXL_READ_FAIL_OVERRUN = 32,
+	DXL_READ_FAIL_FRAMING = 33,
+	DXL_READ_FAIL_NOISE = 34,
+	DXL_READ_FAIL_RX_PIN_LOW = 35,
+	DXL_READ_FAIL_RX_ACTIVITY = 36,
+	DXL_READ_FAIL_TX_ERROR = 37,
+	DXL_READ_FAIL_TX_BUSY = 38,
+	DXL_READ_FAIL_TX_TIMEOUT = 39,
+	DXL_READ_FAIL_DIRECT_RX_TIMEOUT_BASE = 40, // 직접 수신 바이트 수 = STAGE - 40
+};
+// Protocol 2.0 개별 Ping
+uint8_t dxl_ping_2_0(uint8_t id, uint8_t *device_error,
+		uint8_t *fail_stage);
+
+// Protocol 2.0 개별 Read
+uint8_t dxl_read_2_0(uint8_t id, uint16_t addr, uint16_t data_len,
+		uint8_t *data, uint8_t *device_error, uint8_t *fail_stage);
+
 // 동기화 제어 함수 (Sync Write)
 void send_sync_write_1(uint16_t addr, uint16_t data_len, int16_t *wheel_data);
 
@@ -151,7 +187,7 @@ void dxl_sync_write_4byte(uint8_t *ids, uint32_t *values, uint8_t count,
 		uint16_t addr);
 
 // Dynamixel 패킷 전송 함수 (USART1 바퀴, USART6 다리)
-void uart_transmit_packet(UART_HandleTypeDef *huart, uint8_t *data,
-		uint16_t size);
+HAL_StatusTypeDef uart_transmit_packet(UART_HandleTypeDef *huart,
+		uint8_t *data, uint16_t size);
 
 #endif /* INC_DXL_2_0_H_ */

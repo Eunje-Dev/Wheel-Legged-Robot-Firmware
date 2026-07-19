@@ -94,10 +94,10 @@ int main(void) {
 	/* Initialize all configured peripherals */
 	MX_GPIO_Init();
 	MX_DMA_Init();
-	MX_USART3_UART_Init(); // Jetson 통신
-	MX_USART6_UART_Init(); // 다리 MX 모터
-	MX_USART1_UART_Init(); // 바퀴 AX 모터
-	MX_USART2_UART_Init(); // IMU
+	MX_USART3_UART_Init();
+	MX_USART6_UART_Init();
+	MX_USART1_UART_Init();
+	MX_USART2_UART_Init();
 	/* USER CODE BEGIN 2 */
 	IMU_Init(&huart2);      // IMU UART 핸들 등록
 	if (IMU_Start_DMA() != HAL_OK) { // DMA 수신 시작
@@ -107,6 +107,8 @@ int main(void) {
 	Robot_Motion_Init(); // 로봇 동작 상태 초기화
 	Jetson_Comm_Init(&huart3); // Jetson VCP 통신 초기화
 
+	// 모터 Ping 분리 시험 동안 부팅 시 다리 모터 송신 비활성화
+#if 0
 	uint8_t leg_ids[12];     // 12개 다리 모터 ID 배열
 	uint8_t srl_values[12];  // 각 모터의 SRL 설정값 배열
 
@@ -127,6 +129,7 @@ int main(void) {
 
 	// 시작 시 Wheel Mode 자세 설정
 	Robot_Set_Wheel_Mode();
+#endif
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
@@ -249,41 +252,42 @@ void IMU_Task(void) {
 		g_imu_data.updated = 0;
 	}
 
-		// IMU 데이터 수신 중단 시 유효 상태 해제
-		if (!data.valid) {
-			g_imu_data.valid = 0;
-		}
+	// IMU 데이터 수신 중단 시 유효 상태 해제
+	if (!data.valid) {
+		g_imu_data.valid = 0;
 	}
+}
 
 // USER 버튼 인터럽트 콜백
-	void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-		static uint32_t last_button_tick = 0;
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+	static uint32_t last_button_tick = 0;
 
-		if (GPIO_Pin == GPIO_PIN_13) {
-			uint32_t current_tick = HAL_GetTick();
+	if (GPIO_Pin == GPIO_PIN_13) {
+		uint32_t current_tick = HAL_GetTick();
 
-			// 버튼 채터링 방지
-			if ((current_tick - last_button_tick) >= 300U) {
-				mode_button_request = 1;
-				last_button_tick = current_tick;
-			}
+		// 버튼 채터링 방지
+		if ((current_tick - last_button_tick) >= 300U) {
+			mode_button_request = 1;
+			last_button_tick = current_tick;
 		}
 	}
+}
 
-	/* USER CODE END 4 */
+/* USER CODE END 4 */
 
-	/**
-	 * @brief  This function is executed in case of error occurrence.
-	 * @retval None
-	 */
-	void Error_Handler(void) {
-		/* USER CODE BEGIN Error_Handler_Debug */
-		/* User can add his own implementation to report the HAL error return state */
-		__disable_irq();
-		while (1) {
-		}
+/**
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
+	/* USER CODE BEGIN Error_Handler_Debug */
+	/* User can add his own implementation to report the HAL error return state */
+	__disable_irq();
+	while (1) {
 	}
+
 	/* USER CODE END Error_Handler_Debug */
+}
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number

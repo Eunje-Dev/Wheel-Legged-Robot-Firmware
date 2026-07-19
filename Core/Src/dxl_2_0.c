@@ -91,8 +91,9 @@ dxl_sync_write_1_0 creat_sync_packet_1_0(void) {
 }
 
 // UART 패킷 전송 및 TX Enable 제어 (USART1/USART6 분기)
-void uart_transmit_packet(UART_HandleTypeDef *huart, uint8_t *data,
-		uint16_t size) {
+HAL_StatusTypeDef uart_transmit_packet(UART_HandleTypeDef *huart,
+		uint8_t *data, uint16_t size) {
+	HAL_StatusTypeDef tx_status;
 
 	// SN74LS241N 버퍼 Enable 제어 (코드 기준)
 	// TX 전송 시 EN=HIGH, 전송 완료 후 EN=LOW
@@ -110,11 +111,13 @@ void uart_transmit_packet(UART_HandleTypeDef *huart, uint8_t *data,
 	// for (volatile int i = 0; i < 50; i++) { __NOP(); }
 
 	// 2) 데이터 전송 (Timeout 20ms)
-	(void) HAL_UART_Transmit(huart, data, size, 20);
+	tx_status = HAL_UART_Transmit(huart, data, size, 20);
 
 	// 3) 전송 완료(TC)까지 대기 (마지막 stop bit까지)
-	while (__HAL_UART_GET_FLAG(huart, UART_FLAG_TC) == RESET) {
-		;
+	if (tx_status == HAL_OK) {
+		while (__HAL_UART_GET_FLAG(huart, UART_FLAG_TC) == RESET) {
+			;
+		}
 	}
 
 	// 4) TX Disable (버스 반환)
@@ -123,6 +126,8 @@ void uart_transmit_packet(UART_HandleTypeDef *huart, uint8_t *data,
 	} else if (huart->Instance == USART6) {
 		HAL_GPIO_WritePin(DXL_TX_EN6_GPIO_Port, DXL_TX_EN6_Pin, GPIO_PIN_RESET);
 	}
+
+	return tx_status;
 }
 
 // Sync Write 전송 - Protocol 1.0 (바퀴 제어용, UART1 유지)
@@ -260,6 +265,357 @@ void dxl_write_2_0(uint8_t id, uint16_t addr, uint8_t data_len, uint32_t data) {
 
 	// 다리 모터는 UART6 사용
 	uart_transmit_packet(&huart6, dxl_tx_buffer, idx);
+}
+
+// Protocol 2.0 개별 Read (다리용, UART6)
+uint8_t dxl_read_2_0(uint8_t id, uint16_t addr, uint16_t data_len,
+		uint8_t *data, uint8_t *device_error, uint8_t *fail_stage) {
+	uint8_t tx_packet[14];
+	uint8_t rx_packet[64];
+	uint16_t tx_idx = 0;
+	uint16_t packet_length;
+	uint16_t total_length;
+	uint16_t received_crc;
+	uint16_t received_count;
+	uint16_t src_idx;
+	uint16_t dst_idx = 0;
+	uint16_t param_end;
+	uint16_t calculated_crc;
+	uint32_t rx_start_tick;
+	uint32_t primask;
+	HAL_StatusTypeDef tx_status;
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_ARGUMENT;
+	}
+
+	if (data == NULL || data_len == 0 || data_len > 32 || id > 252) {
+		return 0;
+	}
+
+	if (device_error != NULL) {
+		*device_error = 0xFF;
+	}
+
+	// Read 명령 패킷 생성
+	tx_packet[tx_idx++] = 0xFF;
+	tx_packet[tx_idx++] = 0xFF;
+	tx_packet[tx_idx++] = 0xFD;
+	tx_packet[tx_idx++] = 0x00;
+	tx_packet[tx_idx++] = id;
+
+	// Length = Instruction(1) + Parameter(4) + CRC(2)
+	tx_packet[tx_idx++] = 0x07;
+	tx_packet[tx_idx++] = 0x00;
+
+	tx_packet[tx_idx++] = DXL_INST_READ;
+	tx_packet[tx_idx++] = addr & 0xFF;
+	tx_packet[tx_idx++] = (addr >> 8) & 0xFF;
+	tx_packet[tx_idx++] = data_len & 0xFF;
+	tx_packet[tx_idx++] = (data_len >> 8) & 0xFF;
+
+	calculated_crc = update_crc(0, tx_packet, tx_idx);
+	tx_packet[tx_idx++] = calculated_crc & 0xFF;
+	tx_packet[tx_idx++] = (calculated_crc >> 8) & 0xFF;
+
+	// 이전 UART 수신 데이터 제거
+	__HAL_UART_CLEAR_OREFLAG(&huart6);
+	__HAL_UART_SEND_REQ(&huart6, UART_RXDATA_FLUSH_REQUEST);
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_HEADER_RX;
+	}
+
+	// Read 명령 전송 후 수신 방향으로 전환
+	primask = __get_PRIMASK();
+	__disable_irq();
+	tx_status = uart_transmit_packet(&huart6, tx_packet, tx_idx);
+	__set_PRIMASK(primask);
+
+	if (tx_status != HAL_OK) {
+		if (fail_stage != NULL) {
+			if (tx_status == HAL_BUSY) {
+				*fail_stage = DXL_READ_FAIL_TX_BUSY;
+			} else if (tx_status == HAL_TIMEOUT) {
+				*fail_stage = DXL_READ_FAIL_TX_TIMEOUT;
+			} else {
+				*fail_stage = DXL_READ_FAIL_TX_ERROR;
+			}
+		}
+
+		return 0;
+	}
+
+	received_count = 0U;
+	rx_start_tick = HAL_GetTick();
+
+	// Status Packet 헤더를 USART6 수신 레지스터에서 직접 확인
+	while (received_count < 7U
+			&& (HAL_GetTick() - rx_start_tick) < 10U) {
+		if ((huart6.Instance->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
+			rx_packet[received_count++] =
+					(uint8_t) (huart6.Instance->RDR & 0xFFU);
+		}
+	}
+
+	if (received_count != 7U) {
+		if (fail_stage != NULL) {
+			*fail_stage = DXL_READ_FAIL_DIRECT_RX_TIMEOUT_BASE
+					+ (uint8_t) received_count;
+		}
+
+		return 0;
+	}
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_HEADER;
+	}
+
+	// Status Packet 헤더와 모터 ID 확인
+	if (rx_packet[0] != 0xFF || rx_packet[1] != 0xFF || rx_packet[2] != 0xFD
+			|| rx_packet[3] != 0x00 || rx_packet[4] != id) {
+		return 0;
+	}
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_LENGTH;
+	}
+
+	packet_length = (uint16_t) rx_packet[5] | ((uint16_t) rx_packet[6] << 8);
+
+	if (packet_length < 4 || packet_length > (sizeof(rx_packet) - 7)) {
+		return 0;
+	}
+
+	total_length = 7U + packet_length;
+
+	// Status Packet 본문을 USART6 수신 레지스터에서 직접 확인
+	while (received_count < total_length
+			&& (HAL_GetTick() - rx_start_tick) < 10U) {
+		if ((huart6.Instance->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
+			rx_packet[received_count++] =
+					(uint8_t) (huart6.Instance->RDR & 0xFFU);
+		}
+	}
+
+	if (received_count != total_length) {
+		if (fail_stage != NULL) {
+			*fail_stage = DXL_READ_FAIL_DIRECT_RX_TIMEOUT_BASE
+					+ (uint8_t) received_count;
+		}
+
+		return 0;
+	}
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_CRC;
+	}
+
+	// Status Packet CRC 확인
+	received_crc = (uint16_t) rx_packet[total_length - 2]
+			| ((uint16_t) rx_packet[total_length - 1] << 8);
+
+	calculated_crc = update_crc(0, rx_packet, total_length - 2);
+
+	if (received_crc != calculated_crc) {
+		return 0;
+	}
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_STATUS;
+	}
+
+	if (rx_packet[7] != DXL_INST_STATUS) {
+		return 0;
+	}
+
+	if (device_error != NULL) {
+		*device_error = rx_packet[8];
+	}
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_DATA;
+	}
+
+	// Byte Stuffing을 제거하면서 요청한 데이터 복사
+	src_idx = 9;
+	param_end = total_length - 2;
+
+	while (src_idx < param_end) {
+		if (dst_idx >= data_len) {
+			return 0;
+		}
+
+		data[dst_idx++] = rx_packet[src_idx++];
+
+		if (dst_idx >= 3 && data[dst_idx - 3] == 0xFF
+				&& data[dst_idx - 2] == 0xFF && data[dst_idx - 1] == 0xFD
+				&& src_idx < param_end && rx_packet[src_idx] == 0xFD) {
+			src_idx++;
+		}
+	}
+
+	if (dst_idx != data_len) {
+		return 0;
+	}
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_NONE;
+	}
+
+	return 1;
+}
+
+// Protocol 2.0 개별 Ping (다리용, UART6)
+uint8_t dxl_ping_2_0(uint8_t id, uint8_t *device_error,
+		uint8_t *fail_stage) {
+	uint8_t tx_packet[10];
+	uint8_t rx_packet[32];
+	uint16_t tx_idx = 0;
+	uint16_t packet_length;
+	uint16_t total_length;
+	uint16_t received_crc;
+	uint16_t calculated_crc;
+	uint16_t received_count;
+	uint32_t rx_start_tick;
+	uint32_t primask;
+	const uint16_t expected_total_length = 14;
+	HAL_StatusTypeDef tx_status;
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_ARGUMENT;
+	}
+
+	if (id > 252U) {
+		return 0;
+	}
+
+	if (device_error != NULL) {
+		*device_error = 0xFF;
+	}
+
+	// Ping 명령 패킷 생성
+	tx_packet[tx_idx++] = 0xFF;
+	tx_packet[tx_idx++] = 0xFF;
+	tx_packet[tx_idx++] = 0xFD;
+	tx_packet[tx_idx++] = 0x00;
+	tx_packet[tx_idx++] = id;
+	tx_packet[tx_idx++] = 0x03;
+	tx_packet[tx_idx++] = 0x00;
+	tx_packet[tx_idx++] = DXL_INST_PING;
+
+	calculated_crc = update_crc(0, tx_packet, tx_idx);
+	tx_packet[tx_idx++] = calculated_crc & 0xFF;
+	tx_packet[tx_idx++] = (calculated_crc >> 8) & 0xFF;
+
+	// 이전 UART 수신 데이터 제거
+	__HAL_UART_CLEAR_OREFLAG(&huart6);
+	__HAL_UART_SEND_REQ(&huart6, UART_RXDATA_FLUSH_REQUEST);
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_HEADER_RX;
+	}
+
+	// HAL 인터럽트 수신을 사용하지 않고 USART6 레지스터를 직접 확인
+
+	// Ping 명령 전송 후 Status Packet 수신 완료 대기
+	// 송신 완료와 수신 방향 전환 사이의 인터럽트 지연 방지
+	primask = __get_PRIMASK();
+	__disable_irq();
+	tx_status = uart_transmit_packet(&huart6, tx_packet, tx_idx);
+	__set_PRIMASK(primask);
+
+	if (tx_status != HAL_OK) {
+		(void) HAL_UART_AbortReceive(&huart6);
+
+		if (fail_stage != NULL) {
+			if (tx_status == HAL_BUSY) {
+				*fail_stage = DXL_READ_FAIL_TX_BUSY;
+			} else if (tx_status == HAL_TIMEOUT) {
+				*fail_stage = DXL_READ_FAIL_TX_TIMEOUT;
+			} else {
+				*fail_stage = DXL_READ_FAIL_TX_ERROR;
+			}
+		}
+
+		return 0;
+	}
+
+	received_count = 0U;
+	rx_start_tick = HAL_GetTick();
+
+	// USART6 수신 레지스터 직접 확인
+	while (received_count < expected_total_length
+			&& (HAL_GetTick() - rx_start_tick) < 10U) {
+		if ((huart6.Instance->ISR & USART_ISR_RXNE_RXFNE) != 0U) {
+			rx_packet[received_count++] =
+					(uint8_t) (huart6.Instance->RDR & 0xFFU);
+		}
+	}
+
+	if (received_count != expected_total_length) {
+		if (fail_stage != NULL) {
+			*fail_stage = DXL_READ_FAIL_DIRECT_RX_TIMEOUT_BASE
+					+ (uint8_t) received_count;
+		}
+
+		return 0;
+	}
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_HEADER;
+	}
+
+	// Status Packet 헤더와 모터 ID 확인
+	if (rx_packet[0] != 0xFF || rx_packet[1] != 0xFF || rx_packet[2] != 0xFD
+			|| rx_packet[3] != 0x00
+			|| (id != 0xFE && rx_packet[4] != id)) {
+		return 0;
+	}
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_LENGTH;
+	}
+
+	packet_length = (uint16_t) rx_packet[5] | ((uint16_t) rx_packet[6] << 8);
+
+	if (packet_length != 7) {
+		return 0;
+	}
+
+	total_length = 7 + packet_length;
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_CRC;
+	}
+
+	// Status Packet CRC 확인
+	received_crc = (uint16_t) rx_packet[total_length - 2]
+			| ((uint16_t) rx_packet[total_length - 1] << 8);
+
+	calculated_crc = update_crc(0, rx_packet, total_length - 2);
+
+	if (received_crc != calculated_crc) {
+		return 0;
+	}
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_STATUS;
+	}
+
+	if (rx_packet[7] != DXL_INST_STATUS) {
+		return 0;
+	}
+
+	if (device_error != NULL) {
+		*device_error = rx_packet[8];
+	}
+
+	if (fail_stage != NULL) {
+		*fail_stage = DXL_READ_FAIL_NONE;
+	}
+
+	return 1;
 }
 
 // Protocol 2.0 Sync Write 1바이트 (여러 모터 동시 제어)

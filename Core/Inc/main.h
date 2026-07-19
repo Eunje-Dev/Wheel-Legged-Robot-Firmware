@@ -57,8 +57,8 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define DXL_TX_EN6_Pin GPIO_PIN_8
-#define DXL_TX_EN6_GPIO_Port GPIOC
+#define DXL_TX_EN6_Pin GPIO_PIN_11
+#define DXL_TX_EN6_GPIO_Port GPIOE
 #define DXL_TX_EN1_Pin GPIO_PIN_8
 #define DXL_TX_EN1_GPIO_Port GPIOB
 

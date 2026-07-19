@@ -7,7 +7,9 @@
 #include "jetson_comm.h"
 #include "robot_motion.h"
 #include "imu_driver.h"
+#include "dxl_2_0.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static UART_HandleTypeDef *jetson_huart;
@@ -47,8 +49,237 @@ static void Jetson_Send_IMU(void) {
 			(unsigned long) data.sequence, (unsigned long) data.timestamp_ms);
 
 	if (length > 0 && length < (int) sizeof(tx_line)) {
-		(void) HAL_UART_Transmit(jetson_huart, (uint8_t*) tx_line,
-				(uint16_t) length, 20);
+		Jetson_Send_Text(tx_line);
+	}
+}
+
+// 다리 관절 모터 ID 확인 함수 선언
+static uint8_t Jetson_Is_Leg_Motor_ID(uint8_t id);
+
+// 현재 모터 속도 송신
+static void Jetson_Send_Motor_Velocity(const char *id_text) {
+	char *end_ptr;
+	unsigned long id_value;
+	uint8_t velocity_data[4];
+	uint8_t device_error = 0xFF;
+	uint8_t fail_stage = DXL_READ_FAIL_NONE;
+	char tx_line[96];
+
+	id_value = strtoul(id_text, &end_ptr, 10);
+
+	if (id_text == end_ptr || *end_ptr != '\0' || id_value > 252
+			|| !Jetson_Is_Leg_Motor_ID((uint8_t) id_value)) {
+		Jetson_Send_Text("MOTOR_VEL:VALID=0,REASON=ID\r\n");
+		return;
+	}
+
+	uint8_t id = (uint8_t) id_value;
+
+	if (!dxl_read_2_0(id, DXL_2_Present_Velocity, 4, velocity_data,
+			&device_error, &fail_stage)) {
+		int length = snprintf(tx_line, sizeof(tx_line),
+				"MOTOR_VEL:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
+				(unsigned int) id, (unsigned int) fail_stage);
+
+		if (length > 0 && length < (int) sizeof(tx_line)) {
+			Jetson_Send_Text(tx_line);
+		}
+		return;
+	}
+
+	int32_t velocity = (int32_t) ((uint32_t) velocity_data[0]
+			| ((uint32_t) velocity_data[1] << 8)
+			| ((uint32_t) velocity_data[2] << 16)
+			| ((uint32_t) velocity_data[3] << 24));
+
+	int length = snprintf(tx_line, sizeof(tx_line),
+			"MOTOR_VEL:ID=%u,VEL=%ld,STATUS_ERR=%u,VALID=1\r\n",
+			(unsigned int) id, (long) velocity, (unsigned int) device_error);
+
+	if (length > 0 && length < (int) sizeof(tx_line)) {
+		Jetson_Send_Text(tx_line);
+	}
+}
+
+// 현재 모터 전류 송신
+static void Jetson_Send_Motor_Current(const char *id_text) {
+	char *end_ptr;
+	unsigned long id_value;
+	uint8_t current_data[2];
+	uint8_t device_error = 0xFF;
+	uint8_t fail_stage = DXL_READ_FAIL_NONE;
+	char tx_line[128];
+
+	id_value = strtoul(id_text, &end_ptr, 10);
+
+	if (id_text == end_ptr || *end_ptr != '\0' || id_value > 252
+			|| !Jetson_Is_Leg_Motor_ID((uint8_t) id_value)) {
+		Jetson_Send_Text("MOTOR_CURRENT:VALID=0,REASON=ID\r\n");
+		return;
+	}
+
+	uint8_t id = (uint8_t) id_value;
+
+	if (!dxl_read_2_0(id, DXL_2_Present_Current, 2, current_data, &device_error,
+			&fail_stage)) {
+		int length = snprintf(tx_line, sizeof(tx_line),
+				"MOTOR_CURRENT:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
+				(unsigned int) id, (unsigned int) fail_stage);
+
+		if (length > 0 && length < (int) sizeof(tx_line)) {
+			Jetson_Send_Text(tx_line);
+		}
+		return;
+	}
+
+	int16_t current_raw = (int16_t) ((uint16_t) current_data[0]
+			| ((uint16_t) current_data[1] << 8));
+	int32_t current_ma_x100 = (int32_t) current_raw * 336;
+
+	int length = snprintf(tx_line, sizeof(tx_line),
+			"MOTOR_CURRENT:ID=%u,CURRENT_RAW=%d,CURRENT_MA_X100=%ld,"
+					"STATUS_ERR=%u,VALID=1\r\n", (unsigned int) id,
+			(int) current_raw, (long) current_ma_x100,
+			(unsigned int) device_error);
+
+	if (length > 0 && length < (int) sizeof(tx_line)) {
+		Jetson_Send_Text(tx_line);
+	}
+}
+
+// 모터 하드웨어 에러 상태 송신
+static void Jetson_Send_Motor_Hardware_Error(const char *id_text) {
+	char *end_ptr;
+	unsigned long id_value;
+	uint8_t hardware_error = 0U;
+	uint8_t device_error = 0xFFU;
+	uint8_t fail_stage = DXL_READ_FAIL_NONE;
+	char tx_line[96];
+
+	id_value = strtoul(id_text, &end_ptr, 10);
+
+	if (id_text == end_ptr || *end_ptr != '\0' || id_value > 252
+			|| !Jetson_Is_Leg_Motor_ID((uint8_t) id_value)) {
+		Jetson_Send_Text("MOTOR_ERROR:VALID=0,REASON=ID\r\n");
+		return;
+	}
+
+	uint8_t id = (uint8_t) id_value;
+
+	if (!dxl_read_2_0(id, DXL_2_Hardware_Error_Status, 1, &hardware_error,
+			&device_error, &fail_stage)) {
+		int length = snprintf(tx_line, sizeof(tx_line),
+				"MOTOR_ERROR:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
+				(unsigned int) id, (unsigned int) fail_stage);
+
+		if (length > 0 && length < (int) sizeof(tx_line)) {
+			Jetson_Send_Text(tx_line);
+		}
+		return;
+	}
+
+	int length = snprintf(tx_line, sizeof(tx_line),
+			"MOTOR_ERROR:ID=%u,HW_ERROR=%u,STATUS_ERR=%u,VALID=1\r\n",
+			(unsigned int) id, (unsigned int) hardware_error,
+			(unsigned int) device_error);
+
+	if (length > 0 && length < (int) sizeof(tx_line)) {
+		Jetson_Send_Text(tx_line);
+	}
+}
+
+// 다리 관절 모터 ID 확인
+static uint8_t Jetson_Is_Leg_Motor_ID(uint8_t id) {
+	for (int i = 1; i <= leg_count; i++) {
+		if (id == legs[i].roll || id == legs[i].pitch || id == legs[i].knee) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+// 모터 Ping 결과 송신
+static void Jetson_Send_Motor_Ping(const char *id_text) {
+	char *end_ptr;
+	unsigned long id_value;
+	uint8_t device_error = 0xFF;
+	uint8_t fail_stage = DXL_READ_FAIL_NONE;
+	char tx_line[96];
+
+	id_value = strtoul(id_text, &end_ptr, 10);
+
+	if (id_text == end_ptr || *end_ptr != '\0'
+			|| (id_value > 252 && id_value != 254)
+			|| (id_value != 254 && !Jetson_Is_Leg_Motor_ID((uint8_t) id_value))) {
+		Jetson_Send_Text("MOTOR_PING:VALID=0,REASON=ID\r\n");
+		return;
+	}
+
+	uint8_t id = (uint8_t) id_value;
+
+	if (!dxl_ping_2_0(id, &device_error, &fail_stage)) {
+		int length = snprintf(tx_line, sizeof(tx_line),
+				"MOTOR_PING:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
+				(unsigned int) id, (unsigned int) fail_stage);
+
+		if (length > 0 && length < (int) sizeof(tx_line)) {
+			Jetson_Send_Text(tx_line);
+		}
+		return;
+	}
+
+	int length = snprintf(tx_line, sizeof(tx_line),
+			"MOTOR_PING:ID=%u,STATUS_ERR=%u,VALID=1\r\n", (unsigned int) id,
+			(unsigned int) device_error);
+
+	if (length > 0 && length < (int) sizeof(tx_line)) {
+		Jetson_Send_Text(tx_line);
+	}
+}
+
+// 현재 모터 위치 송신
+static void Jetson_Send_Motor_Position(const char *id_text) {
+	char *end_ptr;
+	unsigned long id_value;
+	uint8_t position_data[4];
+	uint8_t device_error = 0xFF;
+	uint8_t fail_stage = DXL_READ_FAIL_NONE;
+	char tx_line[96];
+
+	id_value = strtoul(id_text, &end_ptr, 10);
+
+	if (id_text == end_ptr || *end_ptr != '\0' || id_value > 252
+			|| !Jetson_Is_Leg_Motor_ID((uint8_t) id_value)) {
+		Jetson_Send_Text("MOTOR:VALID=0,REASON=ID\r\n");
+		return;
+	}
+
+	uint8_t id = (uint8_t) id_value;
+
+	if (!dxl_read_2_0(id, DXL_2_Present_Position, 4, position_data,
+			&device_error, &fail_stage)) {
+		int length = snprintf(tx_line, sizeof(tx_line),
+				"MOTOR:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
+				(unsigned int) id, (unsigned int) fail_stage);
+
+		if (length > 0 && length < (int) sizeof(tx_line)) {
+			Jetson_Send_Text(tx_line);
+		}
+		return;
+	}
+
+	int32_t position = (int32_t) ((uint32_t) position_data[0]
+			| ((uint32_t) position_data[1] << 8)
+			| ((uint32_t) position_data[2] << 16)
+			| ((uint32_t) position_data[3] << 24));
+
+	int length = snprintf(tx_line, sizeof(tx_line),
+			"MOTOR:ID=%u,POS=%ld,STATUS_ERR=%u,VALID=1\r\n", (unsigned int) id,
+			(long) position, (unsigned int) device_error);
+
+	if (length > 0 && length < (int) sizeof(tx_line)) {
+		Jetson_Send_Text(tx_line);
 	}
 }
 
@@ -114,6 +345,16 @@ void Jetson_Comm_Task(void) {
 		Jetson_Send_Text("OK\r\n");
 	} else if (strcmp(command, "GET_IMU") == 0) {
 		Jetson_Send_IMU();
+	} else if (strncmp(command, "PING_MOTOR:", 11) == 0) {
+		Jetson_Send_Motor_Ping(command + 11);
+	} else if (strncmp(command, "GET_MOTOR_CURRENT:", 18) == 0) {
+		Jetson_Send_Motor_Current(command + 18);
+	} else if (strncmp(command, "GET_MOTOR_ERROR:", 16) == 0) {
+		Jetson_Send_Motor_Hardware_Error(command + 16);
+	} else if (strncmp(command, "GET_MOTOR_VEL:", 14) == 0) {
+		Jetson_Send_Motor_Velocity(command + 14);
+	} else if (strncmp(command, "GET_MOTOR:", 10) == 0) {
+		Jetson_Send_Motor_Position(command + 10);
 	} else if (strcmp(command, "STOP") == 0) {
 		Robot_Wheel_Stop();
 	} else if (strcmp(command, "FWD") == 0) {
