@@ -107,8 +107,6 @@ int main(void) {
 	Robot_Motion_Init(); // 로봇 동작 상태 초기화
 	Jetson_Comm_Init(&huart3); // Jetson VCP 통신 초기화
 
-	// 모터 Ping 분리 시험 동안 부팅 시 다리 모터 송신 비활성화
-#if 0
 	uint8_t leg_ids[12];     // 12개 다리 모터 ID 배열
 	uint8_t srl_values[12];  // 각 모터의 SRL 설정값 배열
 
@@ -129,7 +127,6 @@ int main(void) {
 
 	// 시작 시 Wheel Mode 자세 설정
 	Robot_Set_Wheel_Mode();
-#endif
 	/* USER CODE END 2 */
 
 	/* Infinite loop */
