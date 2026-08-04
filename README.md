@@ -6,7 +6,7 @@ Jetson으로부터 동작 명령을 수신하고, DYNAMIXEL 모터를 이용한 
 
 ## 프로젝트 개요
 
-WoKi는 바퀴 주행과 다리 자세 전환이 가능한 휠-레그 로봇입니다.
+**WoKi (Wheels-on-Knees Integrated robot)**는 바퀴 주행과 다리 자세 전환이 가능한 휠-레그 로봇입니다.
 
 이 저장소에는 다음 기능을 담당하는 STM32 펌웨어가 포함되어 있습니다.
 
@@ -129,6 +129,7 @@ Drivers/
 
 | 항목 | 내용 |
 |---|---|
+| Board | NUCLEO-H753ZI |
 | MCU | STM32H753ZIT6 |
 | IDE | STM32CubeIDE |
 | STM32CubeMX | 6.16.1 |
