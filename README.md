@@ -129,6 +129,8 @@ Drivers/
 
 | 항목 | 내용 |
 |---|---|
+| 개발 기간 | 2025.08 – 현재 |
+| 담당 역할 | STM32 하위 제어 펌웨어 전체 설계·구현 및 하드웨어 디버깅 |
 | Board | NUCLEO-H753ZI |
 | MCU | STM32H753ZIT6 |
 | IDE | STM32CubeIDE |
@@ -161,3 +163,7 @@ STM32CubeIDE가 자동 생성하는 다음 빌드 결과물은 Git에서 제외�
 - PC 환경에 따라 변경되는 `language.settings.xml`
 
 소스 코드와 프로젝트 설정 파일을 중심으로 버전 관리합니다.
+
+## 관련 링크
+
+- [Notion 포트폴리오](https://catkin-gourd-05e.notion.site/3b16fa7720df808daed3ff86a33b93f0?source=copy_link)
