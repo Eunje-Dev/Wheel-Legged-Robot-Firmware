@@ -125,6 +125,27 @@ int main(void) {
 	dxl_sync_write_1byte(leg_ids, srl_values, 12, DXL_2_Status_Return_Level);
 	HAL_Delay(50);
 
+	// 다리 모터 위치 제어 PID 및 Goal PWM 설정값
+	const uint16_t position_d_gain = 0;
+	const uint16_t position_i_gain = 0;
+	const uint16_t position_p_gain = 850;
+	const uint16_t goal_pwm = 885;
+
+	// 12개 다리 모터의 위치 제어 PID 및 Goal PWM 설정
+	for (int i = 0; i < 12; i++) {
+		dxl_write_2_0(leg_ids[i], DXL_2_Position_D_Gain, 2,
+				position_d_gain);
+
+		dxl_write_2_0(leg_ids[i], DXL_2_Position_I_Gain, 2,
+				position_i_gain);
+
+		dxl_write_2_0(leg_ids[i], DXL_2_Position_P_Gain, 2,
+				position_p_gain);
+
+		dxl_write_2_0(leg_ids[i], DXL_2_Goal_PWM, 2, goal_pwm);
+	}
+	HAL_Delay(50);
+
 	// 시작 시 Wheel Mode 자세 설정
 	Robot_Set_Wheel_Mode();
 	/* USER CODE END 2 */

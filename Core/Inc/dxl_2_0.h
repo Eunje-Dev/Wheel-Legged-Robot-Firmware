@@ -47,7 +47,10 @@ enum Dxl_2_0_Addr {
 	DXL_2_LED = 65,                // LED 제어
 	DXL_2_Status_Return_Level = 68, // 응답레벨
 	DXL_2_Hardware_Error_Status = 70, // 하드웨어 에러 상태
-	DXL_2_Goal_PWM = 100,          // 목표 PWM 값
+	DXL_2_Position_D_Gain = 80,     // 위치 제어 D Gain
+	DXL_2_Position_I_Gain = 82,     // 위치 제어 I Gain
+	DXL_2_Position_P_Gain = 84,     // 위치 제어 P Gain
+	DXL_2_Goal_PWM = 100,           // 목표 PWM 값
 	DXL_2_Profile_Acceleration = 108, // 프로파일 가속도
 	DXL_2_Profile_Velocity = 112,  // 프로파일 속도
 	DXL_2_Goal_Position = 116,     // 목표 위치 (Position Control Mode)
