@@ -32,6 +32,22 @@ static volatile uint8_t line_ready = 0;
 		+ (DXL_LEG_MOTOR_COUNT * JETSON_MOTOR_STATE_BIN_DATA_SIZE) \
 		+ JETSON_MOTOR_STATE_BIN_CRC_SIZE)
 
+// 모터 상태 바이너리 DMA 송신 버퍼와 상태
+static uint8_t jetson_motor_state_tx_packet[
+		JETSON_MOTOR_STATE_BIN_PACKET_SIZE];
+static volatile uint8_t jetson_motor_state_tx_busy = 0U;
+static volatile uint32_t jetson_motor_state_total_start_cycle = 0U;
+static volatile uint32_t jetson_motor_state_uart_tx_start_cycle = 0U;
+
+// 모터 상태 바이너리 처리시간 측정값
+static volatile uint32_t jetson_motor_state_sync_read_us = 0U;
+static volatile uint32_t jetson_motor_state_packet_build_us = 0U;
+static volatile uint32_t jetson_motor_state_dma_start_us = 0U;
+static volatile uint32_t jetson_motor_state_cpu_active_us = 0U;
+static volatile uint32_t jetson_motor_state_uart_tx_us = 0U;
+static volatile uint32_t jetson_motor_state_total_us = 0U;
+static volatile HAL_StatusTypeDef jetson_motor_state_tx_status = HAL_ERROR;
+
 // Jetson 문자열 송신
 static void Jetson_Send_Text(const char *text) {
 	(void) HAL_UART_Transmit(jetson_huart, (uint8_t*) text,
@@ -72,6 +88,16 @@ static uint16_t Jetson_Calculate_CRC16_CCITT(const uint8_t *data,
 	}
 
 	return crc;
+}
+
+// CPU Cycle을 마이크로초로 변환
+static uint32_t Jetson_Cycles_To_Us(uint32_t cycles) {
+	if (SystemCoreClock == 0U) {
+		return 0U;
+	}
+
+	return (uint32_t) (((uint64_t) cycles * 1000000ULL)
+			/ (uint64_t) SystemCoreClock);
 }
 
 // IMU 각도를 100배 정수로 변환
@@ -157,33 +183,68 @@ static void Jetson_Send_All_Motor_State(void) {
 // 12개 다리 모터 전체 상태 바이너리 송신
 static void Jetson_Send_All_Motor_State_Binary(void) {
 	DXL_Leg_State_t state;
-	uint8_t tx_packet[JETSON_MOTOR_STATE_BIN_PACKET_SIZE];
 	uint16_t tx_index = 0U;
 	uint16_t crc;
+	uint32_t total_start_cycle;
+	uint32_t sync_read_end_cycle;
+	uint32_t packet_build_end_cycle;
+	uint32_t dma_start_end_cycle;
+	HAL_StatusTypeDef tx_status;
+
+	jetson_motor_state_sync_read_us = 0U;
+	jetson_motor_state_packet_build_us = 0U;
+	jetson_motor_state_dma_start_us = 0U;
+	jetson_motor_state_cpu_active_us = 0U;
+	jetson_motor_state_uart_tx_us = 0U;
+	jetson_motor_state_total_us = 0U;
+	jetson_motor_state_tx_status = HAL_ERROR;
+
+	total_start_cycle = DWT->CYCCNT;
 
 	(void) dxl_sync_read_leg_state(&state);
 
-	// 패킷 Header와 기본 정보 저장
-	tx_packet[tx_index++] = JETSON_MOTOR_STATE_BIN_HEADER_0;
-	tx_packet[tx_index++] = JETSON_MOTOR_STATE_BIN_HEADER_1;
-	tx_packet[tx_index++] = JETSON_MOTOR_STATE_BIN_VERSION;
-	tx_packet[tx_index++] = JETSON_MOTOR_STATE_BIN_TYPE;
+	sync_read_end_cycle = DWT->CYCCNT;
+	jetson_motor_state_sync_read_us = Jetson_Cycles_To_Us(
+			sync_read_end_cycle - total_start_cycle);
 
-	Jetson_Write_U16_LE(tx_packet, &tx_index,
+	// 이전 바이너리 패킷 DMA 송신 중에는 새 패킷을 덮어쓰지 않음
+	if (jetson_motor_state_tx_busy != 0U) {
+		dma_start_end_cycle = DWT->CYCCNT;
+		jetson_motor_state_cpu_active_us = Jetson_Cycles_To_Us(
+				dma_start_end_cycle - total_start_cycle);
+		jetson_motor_state_total_us = jetson_motor_state_cpu_active_us;
+		jetson_motor_state_tx_status = HAL_BUSY;
+		return;
+	}
+
+	// 패킷 Header와 기본 정보 저장
+	jetson_motor_state_tx_packet[tx_index++] =
+			JETSON_MOTOR_STATE_BIN_HEADER_0;
+	jetson_motor_state_tx_packet[tx_index++] =
+			JETSON_MOTOR_STATE_BIN_HEADER_1;
+	jetson_motor_state_tx_packet[tx_index++] =
+			JETSON_MOTOR_STATE_BIN_VERSION;
+	jetson_motor_state_tx_packet[tx_index++] =
+			JETSON_MOTOR_STATE_BIN_TYPE;
+
+	Jetson_Write_U16_LE(jetson_motor_state_tx_packet, &tx_index,
 			(uint16_t) JETSON_MOTOR_STATE_BIN_PACKET_SIZE);
-	Jetson_Write_U32_LE(tx_packet, &tx_index, state.sequence);
-	Jetson_Write_U32_LE(tx_packet, &tx_index, state.timestamp_ms);
-	Jetson_Write_U16_LE(tx_packet, &tx_index, state.valid_mask);
+	Jetson_Write_U32_LE(jetson_motor_state_tx_packet, &tx_index,
+			state.sequence);
+	Jetson_Write_U32_LE(jetson_motor_state_tx_packet, &tx_index,
+			state.timestamp_ms);
+	Jetson_Write_U16_LE(jetson_motor_state_tx_packet, &tx_index,
+			state.valid_mask);
 
 	// 모터 ID 순서: 1, 2, 3, 11, 12, 13, 21, 22, 23, 31, 32, 33
 	for (uint8_t i = 0U; i < DXL_LEG_MOTOR_COUNT; i++) {
 		const DXL_Leg_Motor_State_t *motor = &state.motors[i];
 
-		Jetson_Write_U32_LE(tx_packet, &tx_index,
+		Jetson_Write_U32_LE(jetson_motor_state_tx_packet, &tx_index,
 				(uint32_t) motor->position_raw);
-		Jetson_Write_U32_LE(tx_packet, &tx_index,
+		Jetson_Write_U32_LE(jetson_motor_state_tx_packet, &tx_index,
 				(uint32_t) motor->velocity_raw);
-		Jetson_Write_U16_LE(tx_packet, &tx_index,
+		Jetson_Write_U16_LE(jetson_motor_state_tx_packet, &tx_index,
 				(uint16_t) motor->current_raw);
 	}
 
@@ -191,18 +252,72 @@ static void Jetson_Send_All_Motor_State_Binary(void) {
 	if (tx_index
 			!= (JETSON_MOTOR_STATE_BIN_PACKET_SIZE
 					- JETSON_MOTOR_STATE_BIN_CRC_SIZE)) {
+		jetson_motor_state_tx_status = HAL_ERROR;
 		return;
 	}
 
-	crc = Jetson_Calculate_CRC16_CCITT(tx_packet, tx_index);
-	Jetson_Write_U16_LE(tx_packet, &tx_index, crc);
+	crc = Jetson_Calculate_CRC16_CCITT(
+			jetson_motor_state_tx_packet, tx_index);
+
+	Jetson_Write_U16_LE(jetson_motor_state_tx_packet, &tx_index, crc);
 
 	// 최종 패킷 길이가 정확한 경우에만 송신
 	if (tx_index != JETSON_MOTOR_STATE_BIN_PACKET_SIZE) {
+		jetson_motor_state_tx_status = HAL_ERROR;
 		return;
 	}
 
-	(void) HAL_UART_Transmit(jetson_huart, tx_packet, tx_index, 20U);
+	packet_build_end_cycle = DWT->CYCCNT;
+	jetson_motor_state_packet_build_us = Jetson_Cycles_To_Us(
+			packet_build_end_cycle - sync_read_end_cycle);
+
+	// DMA 송신 완료 콜백에서 전체 처리시간을 계산할 수 있도록 시작값 저장
+	jetson_motor_state_total_start_cycle = total_start_cycle;
+	jetson_motor_state_uart_tx_start_cycle = DWT->CYCCNT;
+	jetson_motor_state_tx_busy = 1U;
+
+	// DMA가 송신 버퍼의 최신 데이터를 읽도록 메모리 접근 완료
+	__DMB();
+
+	tx_status = HAL_UART_Transmit_DMA(jetson_huart,
+			jetson_motor_state_tx_packet, tx_index);
+
+	dma_start_end_cycle = DWT->CYCCNT;
+
+	jetson_motor_state_dma_start_us = Jetson_Cycles_To_Us(
+			dma_start_end_cycle - packet_build_end_cycle);
+	jetson_motor_state_cpu_active_us = Jetson_Cycles_To_Us(
+			dma_start_end_cycle - total_start_cycle);
+	jetson_motor_state_total_us = jetson_motor_state_cpu_active_us;
+	jetson_motor_state_tx_status = tx_status;
+
+	// DMA 송신 시작에 실패한 경우 버퍼를 다시 사용할 수 있도록 해제
+	if (tx_status != HAL_OK) {
+		jetson_motor_state_tx_busy = 0U;
+	}
+}
+
+// 모터 상태 바이너리 처리시간 송신
+static void Jetson_Send_Motor_State_Timing(void) {
+	char tx_line[224];
+
+	int length = snprintf(tx_line, sizeof(tx_line),
+			"MOTOR_STATE_TIMING:CORE_CLOCK_HZ=%lu,"
+			"SYNC_READ_US=%lu,PACKET_BUILD_US=%lu,"
+			"DMA_START_US=%lu,CPU_ACTIVE_US=%lu,"
+			"UART_TX_US=%lu,TOTAL_US=%lu,TX_STATUS=%u\r\n",
+			(unsigned long) SystemCoreClock,
+			(unsigned long) jetson_motor_state_sync_read_us,
+			(unsigned long) jetson_motor_state_packet_build_us,
+			(unsigned long) jetson_motor_state_dma_start_us,
+			(unsigned long) jetson_motor_state_cpu_active_us,
+			(unsigned long) jetson_motor_state_uart_tx_us,
+			(unsigned long) jetson_motor_state_total_us,
+			(unsigned int) jetson_motor_state_tx_status);
+
+	if (length > 0 && length < (int) sizeof(tx_line)) {
+		Jetson_Send_Text(tx_line);
+	}
 }
 
 // 현재 모터 속도 송신
@@ -438,7 +553,32 @@ void Jetson_Comm_Init(UART_HandleTypeDef *huart) {
 	rx_index = 0;
 	line_ready = 0;
 
+	// 통신 소요시간 측정을 위한 CPU Cycle Counter 활성화
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->LAR = 0xC5ACCE55UL;
+	DWT->CYCCNT = 0U;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
 	HAL_UART_Receive_IT(jetson_huart, &rx_byte, 1);
+}
+
+// Jetson UART DMA 송신 완료 콜백
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+	uint32_t uart_tx_end_cycle;
+
+	if (huart->Instance == USART3
+			&& jetson_motor_state_tx_busy != 0U) {
+		uart_tx_end_cycle = DWT->CYCCNT;
+
+		jetson_motor_state_uart_tx_us = Jetson_Cycles_To_Us(
+				uart_tx_end_cycle
+						- jetson_motor_state_uart_tx_start_cycle);
+		jetson_motor_state_total_us = Jetson_Cycles_To_Us(
+				uart_tx_end_cycle
+						- jetson_motor_state_total_start_cycle);
+
+		jetson_motor_state_tx_busy = 0U;
+	}
 }
 
 // Jetson UART 수신 완료 콜백
@@ -496,6 +636,8 @@ void Jetson_Comm_Task(void) {
 		Jetson_Send_IMU();
 	} else if (strcmp(command, "GET_MOTOR_STATE_BIN") == 0) {
 		Jetson_Send_All_Motor_State_Binary();
+	} else if (strcmp(command, "GET_MOTOR_STATE_TIMING") == 0) {
+		Jetson_Send_Motor_State_Timing();
 	} else if (strcmp(command, "GET_MOTOR_STATE_ALL") == 0) {
 		Jetson_Send_All_Motor_State();
 	} else if (strncmp(command, "PING_MOTOR:", 11) == 0) {
