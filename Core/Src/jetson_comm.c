@@ -56,6 +56,55 @@ static void Jetson_Send_IMU(void) {
 // 다리 관절 모터 ID 확인 함수 선언
 static uint8_t Jetson_Is_Leg_Motor_ID(uint8_t id);
 
+// 12개 다리 모터 전체 상태 송신
+static void Jetson_Send_All_Motor_State(void) {
+	DXL_Leg_State_t state;
+	char tx_part[128];
+	int length;
+
+	(void) dxl_sync_read_leg_state(&state);
+
+	length = snprintf(tx_part, sizeof(tx_part),
+			"MOTOR_STATE_ALL:SEQ=%lu,TIME=%lu,COUNT=%u,"
+			"VALID_MASK=0x%03X,ALL_VALID=%u",
+			(unsigned long) state.sequence,
+			(unsigned long) state.timestamp_ms,
+			(unsigned int) state.received_count,
+			(unsigned int) state.valid_mask,
+			(state.valid_mask == 0x0FFFU) ? 1U : 0U);
+
+	if (length <= 0 || length >= (int) sizeof(tx_part)) {
+		Jetson_Send_Text(
+				"MOTOR_STATE_ALL:VALID=0,REASON=FORMAT\r\n");
+		return;
+	}
+
+	Jetson_Send_Text(tx_part);
+
+	for (uint8_t i = 0U; i < DXL_LEG_MOTOR_COUNT; i++) {
+		const DXL_Leg_Motor_State_t *motor = &state.motors[i];
+
+		length = snprintf(tx_part, sizeof(tx_part),
+				"|ID=%u,POS=%ld,VEL=%ld,CURRENT_RAW=%d,"
+				"STATUS_ERR=%u,VALID=%u",
+				(unsigned int) motor->id,
+				(long) motor->position_raw,
+				(long) motor->velocity_raw,
+				(int) motor->current_raw,
+				(unsigned int) motor->status_error,
+				(unsigned int) motor->valid);
+
+		if (length <= 0 || length >= (int) sizeof(tx_part)) {
+			Jetson_Send_Text("|FORMAT_ERROR=1\r\n");
+			return;
+		}
+
+		Jetson_Send_Text(tx_part);
+	}
+
+	Jetson_Send_Text("\r\n");
+}
+
 // 현재 모터 속도 송신
 static void Jetson_Send_Motor_Velocity(const char *id_text) {
 	char *end_ptr;
@@ -345,6 +394,8 @@ void Jetson_Comm_Task(void) {
 		Jetson_Send_Text("OK\r\n");
 	} else if (strcmp(command, "GET_IMU") == 0) {
 		Jetson_Send_IMU();
+	} else if (strcmp(command, "GET_MOTOR_STATE_ALL") == 0) {
+		Jetson_Send_All_Motor_State();
 	} else if (strncmp(command, "PING_MOTOR:", 11) == 0) {
 		Jetson_Send_Motor_Ping(command + 11);
 	} else if (strncmp(command, "GET_MOTOR_CURRENT:", 18) == 0) {

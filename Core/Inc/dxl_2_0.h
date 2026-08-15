@@ -15,6 +15,9 @@ extern volatile uint8_t uart_tx_busy;
 #define leg_count 4		// 로봇 다리 개수 (4족 로봇)
 #define DXL_SYNC_PARAMS 64
 
+#define DXL_LEG_MOTOR_COUNT          12U
+#define DXL_SYNC_STATE_DATA_LENGTH   10U
+
 // 로봇 다리 번호
 enum RobotLegIndex {
 	LEG_FRONT_LEFT = 1,
@@ -90,6 +93,25 @@ typedef struct {
 typedef struct {
 	uint8_t wheel;
 } WheelMotors;
+
+// MX 모터 한 개의 현재 상태
+typedef struct {
+	uint8_t id;
+	int16_t current_raw;
+	int32_t velocity_raw;
+	int32_t position_raw;
+	uint8_t status_error;
+	uint8_t valid;
+} DXL_Leg_Motor_State_t;
+
+// 12개 다리 모터 전체 상태
+typedef struct {
+	DXL_Leg_Motor_State_t motors[DXL_LEG_MOTOR_COUNT];
+	uint16_t valid_mask;
+	uint32_t timestamp_ms;
+	uint32_t sequence;
+	uint8_t received_count;
+} DXL_Leg_State_t;
 
 // 다리 관절 모터 ID 매핑 테이블 (Protocol 2.0, MX 계열)
 extern LegMotors legs[5];
@@ -169,6 +191,9 @@ uint8_t dxl_ping_2_0(uint8_t id, uint8_t *device_error,
 // Protocol 2.0 개별 Read
 uint8_t dxl_read_2_0(uint8_t id, uint16_t addr, uint16_t data_len,
 		uint8_t *data, uint8_t *device_error, uint8_t *fail_stage);
+
+// 12개 다리 모터 현재 상태 Sync Read
+uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state);
 
 // 동기화 제어 함수 (Sync Write)
 void send_sync_write_1(uint16_t addr, uint16_t data_len, int16_t *wheel_data);

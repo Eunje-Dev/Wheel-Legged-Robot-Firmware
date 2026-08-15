@@ -14,6 +14,24 @@ volatile uint8_t uart_tx_busy = 0;
 // 송신 버퍼 (CPU 직접 접근용)
 static uint8_t dxl_tx_buffer[256];
 
+// 12개 MX Status Packet DMA 수신 버퍼
+#define DXL_SYNC_READ_RX_BUFFER_SIZE         320U
+#define DXL_SYNC_READ_STATUS_PACKET_MAX_SIZE 32U
+#define DXL_SYNC_READ_TIMEOUT_MS             10U
+#define DXL_SYNC_READ_IDLE_TIME_MS           3U
+
+static uint8_t dxl_sync_read_rx_buffer[DXL_SYNC_READ_RX_BUFFER_SIZE];
+
+// 다리 모터 상태 배열 순서
+static const uint8_t dxl_leg_motor_ids[DXL_LEG_MOTOR_COUNT] = {
+		1, 2, 3,
+		11, 12, 13,
+		21, 22, 23,
+		31, 32, 33
+};
+
+static uint32_t dxl_leg_state_sequence = 0U;
+
 // 메인 루프에서 정의된 UART 핸들 참조
 extern UART_HandleTypeDef huart1; // 바퀴(AX, 1Mbps) 제어용
 extern UART_HandleTypeDef huart3; // Jetson VCP 통신용
@@ -78,6 +96,197 @@ uint8_t calculate_checksum_1_0(uint8_t *data, uint16_t length) {
 	for (uint16_t i = 2; i < length; i++)
 		checksum += data[i];
 	return ~checksum;
+}
+
+// 모터 ID에 해당하는 전체 상태 배열 위치 확인
+static int8_t DXL_Sync_Read_Find_Motor_Index(uint8_t id) {
+	for (uint8_t i = 0U; i < DXL_LEG_MOTOR_COUNT; i++) {
+		if (dxl_leg_motor_ids[i] == id) {
+			return (int8_t) i;
+		}
+	}
+
+	return -1;
+}
+
+// 12개 다리 모터 상태 조회 결과 초기화
+static void DXL_Sync_Read_Reset_State(DXL_Leg_State_t *state) {
+	state->valid_mask = 0U;
+	state->timestamp_ms = 0U;
+	state->sequence = 0U;
+	state->received_count = 0U;
+
+	for (uint8_t i = 0U; i < DXL_LEG_MOTOR_COUNT; i++) {
+		state->motors[i].id = dxl_leg_motor_ids[i];
+		state->motors[i].current_raw = 0;
+		state->motors[i].velocity_raw = 0;
+		state->motors[i].position_raw = 0;
+		state->motors[i].status_error = 0xFFU;
+		state->motors[i].valid = 0U;
+	}
+}
+
+// Sync Read Status Packet 한 개 검사 및 상태 저장
+static uint8_t DXL_Sync_Read_Parse_Status_Packet(const uint8_t *packet,
+		uint16_t total_length, DXL_Leg_State_t *state) {
+	uint8_t data[DXL_SYNC_STATE_DATA_LENGTH];
+	uint16_t packet_length;
+	uint16_t received_crc;
+	uint16_t calculated_crc;
+	uint16_t src_index;
+	uint16_t parameter_end;
+	uint8_t data_index = 0U;
+	int8_t motor_index;
+	uint8_t state_index;
+
+	if (packet == NULL || state == NULL || total_length < 11U) {
+		return 0U;
+	}
+
+	// Status Packet 헤더 확인
+	if (packet[0] != 0xFFU || packet[1] != 0xFFU
+			|| packet[2] != 0xFDU || packet[3] != 0x00U) {
+		return 0U;
+	}
+
+	packet_length = (uint16_t) packet[5]
+			| ((uint16_t) packet[6] << 8);
+
+	if (total_length != (uint16_t) (7U + packet_length)) {
+		return 0U;
+	}
+
+	// Status Instruction 확인
+	if (packet[7] != DXL_INST_STATUS) {
+		return 0U;
+	}
+
+	// Status Packet CRC 확인
+	received_crc = (uint16_t) packet[total_length - 2U]
+			| ((uint16_t) packet[total_length - 1U] << 8);
+
+	calculated_crc = update_crc(0U, (uint8_t*) packet,
+			(uint16_t) (total_length - 2U));
+
+	if (received_crc != calculated_crc) {
+		return 0U;
+	}
+
+	motor_index = DXL_Sync_Read_Find_Motor_Index(packet[4]);
+
+	if (motor_index < 0) {
+		return 0U;
+	}
+
+	// Byte Stuffing을 제거하면서 10바이트 상태 데이터 복사
+	src_index = 9U;
+	parameter_end = total_length - 2U;
+
+	while (src_index < parameter_end) {
+		if (data_index >= DXL_SYNC_STATE_DATA_LENGTH) {
+			return 0U;
+		}
+
+		data[data_index++] = packet[src_index++];
+
+		if (data_index >= 3U
+				&& data[data_index - 3U] == 0xFFU
+				&& data[data_index - 2U] == 0xFFU
+				&& data[data_index - 1U] == 0xFDU
+				&& src_index < parameter_end
+				&& packet[src_index] == 0xFDU) {
+			src_index++;
+		}
+	}
+
+	if (data_index != DXL_SYNC_STATE_DATA_LENGTH) {
+		return 0U;
+	}
+
+	state_index = (uint8_t) motor_index;
+
+	// 주소 126부터 Current, Velocity, Position 순서로 저장
+	state->motors[state_index].current_raw =
+			(int16_t) ((uint16_t) data[0]
+					| ((uint16_t) data[1] << 8));
+
+	state->motors[state_index].velocity_raw =
+			(int32_t) ((uint32_t) data[2]
+					| ((uint32_t) data[3] << 8)
+					| ((uint32_t) data[4] << 16)
+					| ((uint32_t) data[5] << 24));
+
+	state->motors[state_index].position_raw =
+			(int32_t) ((uint32_t) data[6]
+					| ((uint32_t) data[7] << 8)
+					| ((uint32_t) data[8] << 16)
+					| ((uint32_t) data[9] << 24));
+
+	state->motors[state_index].status_error = packet[8];
+
+	if (!state->motors[state_index].valid) {
+		state->received_count++;
+	}
+
+	state->motors[state_index].valid = 1U;
+	state->valid_mask |= (uint16_t) (1U << state_index);
+
+	return 1U;
+}
+
+// DMA 수신 버퍼에서 여러 Status Packet 검색
+static void DXL_Sync_Read_Parse_Stream(uint16_t received_length,
+		DXL_Leg_State_t *state) {
+	uint16_t buffer_index = 0U;
+	uint16_t packet_length;
+	uint16_t total_length;
+
+	if (state == NULL || received_length == 0U) {
+		return;
+	}
+
+	if (received_length > DXL_SYNC_READ_RX_BUFFER_SIZE) {
+		received_length = DXL_SYNC_READ_RX_BUFFER_SIZE;
+	}
+
+	while ((uint16_t) (buffer_index + 7U) <= received_length
+			&& state->received_count < DXL_LEG_MOTOR_COUNT) {
+		// Protocol 2.0 헤더 위치 검색
+		if (dxl_sync_read_rx_buffer[buffer_index] != 0xFFU
+				|| dxl_sync_read_rx_buffer[buffer_index + 1U] != 0xFFU
+				|| dxl_sync_read_rx_buffer[buffer_index + 2U] != 0xFDU
+				|| dxl_sync_read_rx_buffer[buffer_index + 3U] != 0x00U) {
+			buffer_index++;
+			continue;
+		}
+
+		packet_length =
+				(uint16_t) dxl_sync_read_rx_buffer[buffer_index + 5U]
+				| ((uint16_t) dxl_sync_read_rx_buffer[buffer_index + 6U] << 8);
+
+		total_length = (uint16_t) (7U + packet_length);
+
+		// 비정상 패킷 길이는 다음 바이트부터 다시 검색
+		if (packet_length < 4U
+				|| total_length > DXL_SYNC_READ_STATUS_PACKET_MAX_SIZE) {
+			buffer_index++;
+			continue;
+		}
+
+		// 마지막 패킷이 아직 완전히 수신되지 않은 경우 종료
+		if ((uint16_t) (buffer_index + total_length) > received_length) {
+			break;
+		}
+
+		if (DXL_Sync_Read_Parse_Status_Packet(
+				&dxl_sync_read_rx_buffer[buffer_index], total_length,
+				state)) {
+			buffer_index = (uint16_t) (buffer_index + total_length);
+		} else {
+			// CRC 또는 패킷 검증 실패 시 다음 헤더를 다시 검색
+			buffer_index++;
+		}
+	}
 }
 
 // Sync Write 패킷 구조체 초기화 (P1.0 - 바퀴)
@@ -464,6 +673,135 @@ uint8_t dxl_read_2_0(uint8_t id, uint16_t addr, uint16_t data_len,
 	}
 
 	return 1;
+}
+
+// 12개 다리 모터 Current, Velocity, Position Sync Read
+uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state) {
+	uint8_t tx_packet[32];
+	uint16_t tx_index = 0U;
+	uint16_t packet_length;
+	uint16_t crc;
+	uint16_t received_length = 0U;
+	uint16_t previous_received_length = 0U;
+	uint32_t start_tick;
+	uint32_t last_activity_tick;
+	uint32_t primask;
+	HAL_StatusTypeDef dma_status;
+	HAL_StatusTypeDef tx_status;
+
+	if (state == NULL) {
+		return 0U;
+	}
+
+	DXL_Sync_Read_Reset_State(state);
+	state->sequence = ++dxl_leg_state_sequence;
+
+	if (huart6.hdmarx == NULL) {
+		state->timestamp_ms = HAL_GetTick();
+		return 0U;
+	}
+
+	// Length = Instruction(1) + Address(2) + Data Length(2) + IDs(12) + CRC(2)
+	packet_length = (uint16_t) (7U + DXL_LEG_MOTOR_COUNT);
+
+	// Protocol 2.0 Sync Read 패킷 생성
+	tx_packet[tx_index++] = 0xFFU;
+	tx_packet[tx_index++] = 0xFFU;
+	tx_packet[tx_index++] = 0xFDU;
+	tx_packet[tx_index++] = 0x00U;
+	tx_packet[tx_index++] = 0xFEU;
+
+	tx_packet[tx_index++] = (uint8_t) (packet_length & 0xFFU);
+	tx_packet[tx_index++] = (uint8_t) ((packet_length >> 8) & 0xFFU);
+
+	tx_packet[tx_index++] = DXL_INST_SYNC_READ;
+
+	// Present Current 주소 126부터 10바이트 조회
+	tx_packet[tx_index++] =
+			(uint8_t) (DXL_2_Present_Current & 0xFFU);
+	tx_packet[tx_index++] =
+			(uint8_t) ((DXL_2_Present_Current >> 8) & 0xFFU);
+
+	tx_packet[tx_index++] =
+			(uint8_t) (DXL_SYNC_STATE_DATA_LENGTH & 0xFFU);
+	tx_packet[tx_index++] =
+			(uint8_t) ((DXL_SYNC_STATE_DATA_LENGTH >> 8) & 0xFFU);
+
+	// 12개 다리 모터 ID 추가
+	for (uint8_t i = 0U; i < DXL_LEG_MOTOR_COUNT; i++) {
+		tx_packet[tx_index++] = dxl_leg_motor_ids[i];
+	}
+
+	crc = update_crc(0U, tx_packet, tx_index);
+	tx_packet[tx_index++] = (uint8_t) (crc & 0xFFU);
+	tx_packet[tx_index++] = (uint8_t) ((crc >> 8) & 0xFFU);
+
+	// 이전 USART6 수신 데이터와 오류 플래그 제거
+	__HAL_UART_CLEAR_FLAG(&huart6,
+			UART_CLEAR_OREF | UART_CLEAR_NEF
+					| UART_CLEAR_PEF | UART_CLEAR_FEF);
+	__HAL_UART_SEND_REQ(&huart6, UART_RXDATA_FLUSH_REQUEST);
+
+	// 첫 번째 모터 응답을 놓치지 않도록 송신 전에 RX DMA 시작
+	dma_status = HAL_UART_Receive_DMA(&huart6,
+			dxl_sync_read_rx_buffer, DXL_SYNC_READ_RX_BUFFER_SIZE);
+
+	if (dma_status != HAL_OK) {
+		state->timestamp_ms = HAL_GetTick();
+		return 0U;
+	}
+
+	// 절반 수신 인터럽트는 사용하지 않음
+	__HAL_DMA_DISABLE_IT(huart6.hdmarx, DMA_IT_HT);
+
+	// 송신 완료와 RX 방향 전환 사이의 인터럽트 지연 방지
+	primask = __get_PRIMASK();
+	__disable_irq();
+	tx_status = uart_transmit_packet(&huart6, tx_packet, tx_index);
+	__set_PRIMASK(primask);
+
+	if (tx_status != HAL_OK) {
+		(void) HAL_UART_AbortReceive(&huart6);
+		state->timestamp_ms = HAL_GetTick();
+		return 0U;
+	}
+
+	start_tick = HAL_GetTick();
+	last_activity_tick = start_tick;
+
+	// DMA 수신량이 1ms 동안 증가하지 않거나 전체 Timeout까지 대기
+	while ((HAL_GetTick() - start_tick) < DXL_SYNC_READ_TIMEOUT_MS) {
+		received_length = (uint16_t) (DXL_SYNC_READ_RX_BUFFER_SIZE
+				- __HAL_DMA_GET_COUNTER(huart6.hdmarx));
+
+		if (received_length != previous_received_length) {
+			previous_received_length = received_length;
+			last_activity_tick = HAL_GetTick();
+		}
+
+		if (received_length >= DXL_SYNC_READ_RX_BUFFER_SIZE) {
+			break;
+		}
+
+		if (received_length > 0U
+				&& (HAL_GetTick() - last_activity_tick)
+						>= DXL_SYNC_READ_IDLE_TIME_MS) {
+			break;
+		}
+	}
+
+	// DMA를 중지하기 전에 최종 수신 바이트 수 저장
+	received_length = (uint16_t) (DXL_SYNC_READ_RX_BUFFER_SIZE
+			- __HAL_DMA_GET_COUNTER(huart6.hdmarx));
+
+	(void) HAL_UART_AbortReceive(&huart6);
+	__DMB();
+
+	DXL_Sync_Read_Parse_Stream(received_length, state);
+
+	state->timestamp_ms = HAL_GetTick();
+
+	return state->valid_mask;
 }
 
 // Protocol 2.0 개별 Ping (다리용, UART6)
