@@ -19,10 +19,59 @@ static char rx_line[64];
 static uint8_t rx_index = 0;
 static volatile uint8_t line_ready = 0;
 
+// 12개 MX 모터 상태 바이너리 패킷 규격
+#define JETSON_MOTOR_STATE_BIN_HEADER_0		0x57U
+#define JETSON_MOTOR_STATE_BIN_HEADER_1		0x4BU
+#define JETSON_MOTOR_STATE_BIN_VERSION		0x01U
+#define JETSON_MOTOR_STATE_BIN_TYPE		0x01U
+#define JETSON_MOTOR_STATE_BIN_HEADER_SIZE	16U
+#define JETSON_MOTOR_STATE_BIN_DATA_SIZE	10U
+#define JETSON_MOTOR_STATE_BIN_CRC_SIZE		2U
+#define JETSON_MOTOR_STATE_BIN_PACKET_SIZE	\
+		(JETSON_MOTOR_STATE_BIN_HEADER_SIZE \
+		+ (DXL_LEG_MOTOR_COUNT * JETSON_MOTOR_STATE_BIN_DATA_SIZE) \
+		+ JETSON_MOTOR_STATE_BIN_CRC_SIZE)
+
 // Jetson 문자열 송신
 static void Jetson_Send_Text(const char *text) {
 	(void) HAL_UART_Transmit(jetson_huart, (uint8_t*) text,
 			(uint16_t) strlen(text), 20);
+}
+
+// 16비트 값을 Little Endian 순서로 저장
+static void Jetson_Write_U16_LE(uint8_t *buffer, uint16_t *index,
+		uint16_t value) {
+	buffer[(*index)++] = (uint8_t) (value & 0xFFU);
+	buffer[(*index)++] = (uint8_t) ((value >> 8) & 0xFFU);
+}
+
+// 32비트 값을 Little Endian 순서로 저장
+static void Jetson_Write_U32_LE(uint8_t *buffer, uint16_t *index,
+		uint32_t value) {
+	buffer[(*index)++] = (uint8_t) (value & 0xFFU);
+	buffer[(*index)++] = (uint8_t) ((value >> 8) & 0xFFU);
+	buffer[(*index)++] = (uint8_t) ((value >> 16) & 0xFFU);
+	buffer[(*index)++] = (uint8_t) ((value >> 24) & 0xFFU);
+}
+
+// 바이너리 패킷 CRC-16/CCITT-FALSE 계산
+static uint16_t Jetson_Calculate_CRC16_CCITT(const uint8_t *data,
+		uint16_t length) {
+	uint16_t crc = 0xFFFFU;
+
+	for (uint16_t i = 0U; i < length; i++) {
+		crc ^= (uint16_t) data[i] << 8;
+
+		for (uint8_t bit = 0U; bit < 8U; bit++) {
+			if ((crc & 0x8000U) != 0U) {
+				crc = (uint16_t) ((crc << 1) ^ 0x1021U);
+			} else {
+				crc = (uint16_t) (crc << 1);
+			}
+		}
+	}
+
+	return crc;
 }
 
 // IMU 각도를 100배 정수로 변환
@@ -103,6 +152,57 @@ static void Jetson_Send_All_Motor_State(void) {
 	}
 
 	Jetson_Send_Text("\r\n");
+}
+
+// 12개 다리 모터 전체 상태 바이너리 송신
+static void Jetson_Send_All_Motor_State_Binary(void) {
+	DXL_Leg_State_t state;
+	uint8_t tx_packet[JETSON_MOTOR_STATE_BIN_PACKET_SIZE];
+	uint16_t tx_index = 0U;
+	uint16_t crc;
+
+	(void) dxl_sync_read_leg_state(&state);
+
+	// 패킷 Header와 기본 정보 저장
+	tx_packet[tx_index++] = JETSON_MOTOR_STATE_BIN_HEADER_0;
+	tx_packet[tx_index++] = JETSON_MOTOR_STATE_BIN_HEADER_1;
+	tx_packet[tx_index++] = JETSON_MOTOR_STATE_BIN_VERSION;
+	tx_packet[tx_index++] = JETSON_MOTOR_STATE_BIN_TYPE;
+
+	Jetson_Write_U16_LE(tx_packet, &tx_index,
+			(uint16_t) JETSON_MOTOR_STATE_BIN_PACKET_SIZE);
+	Jetson_Write_U32_LE(tx_packet, &tx_index, state.sequence);
+	Jetson_Write_U32_LE(tx_packet, &tx_index, state.timestamp_ms);
+	Jetson_Write_U16_LE(tx_packet, &tx_index, state.valid_mask);
+
+	// 모터 ID 순서: 1, 2, 3, 11, 12, 13, 21, 22, 23, 31, 32, 33
+	for (uint8_t i = 0U; i < DXL_LEG_MOTOR_COUNT; i++) {
+		const DXL_Leg_Motor_State_t *motor = &state.motors[i];
+
+		Jetson_Write_U32_LE(tx_packet, &tx_index,
+				(uint32_t) motor->position_raw);
+		Jetson_Write_U32_LE(tx_packet, &tx_index,
+				(uint32_t) motor->velocity_raw);
+		Jetson_Write_U16_LE(tx_packet, &tx_index,
+				(uint16_t) motor->current_raw);
+	}
+
+	// CRC를 제외한 길이가 정확한지 확인
+	if (tx_index
+			!= (JETSON_MOTOR_STATE_BIN_PACKET_SIZE
+					- JETSON_MOTOR_STATE_BIN_CRC_SIZE)) {
+		return;
+	}
+
+	crc = Jetson_Calculate_CRC16_CCITT(tx_packet, tx_index);
+	Jetson_Write_U16_LE(tx_packet, &tx_index, crc);
+
+	// 최종 패킷 길이가 정확한 경우에만 송신
+	if (tx_index != JETSON_MOTOR_STATE_BIN_PACKET_SIZE) {
+		return;
+	}
+
+	(void) HAL_UART_Transmit(jetson_huart, tx_packet, tx_index, 20U);
 }
 
 // 현재 모터 속도 송신
@@ -394,6 +494,8 @@ void Jetson_Comm_Task(void) {
 		Jetson_Send_Text("OK\r\n");
 	} else if (strcmp(command, "GET_IMU") == 0) {
 		Jetson_Send_IMU();
+	} else if (strcmp(command, "GET_MOTOR_STATE_BIN") == 0) {
+		Jetson_Send_All_Motor_State_Binary();
 	} else if (strcmp(command, "GET_MOTOR_STATE_ALL") == 0) {
 		Jetson_Send_All_Motor_State();
 	} else if (strncmp(command, "PING_MOTOR:", 11) == 0) {
