@@ -10,15 +10,27 @@
 
 #include "main.h"
 
-// IMU 3축 자세 데이터 구조체 (roll / pitch / yaw)
+// IMU 자세와 각속도 데이터 구조체
 typedef struct {
 	float roll;    // X축 회전 (좌우 기울기)
 	float pitch;   // Y축 회전 (앞뒤 기울기)
 	float yaw;     // Z축 회전 (방향)
+
+	float quaternion_x; // Quaternion X 성분
+	float quaternion_y; // Quaternion Y 성분
+	float quaternion_z; // Quaternion Z 성분
+	float quaternion_w; // Quaternion W 성분
+
+	float gyro_x_rad_s; // 센서 X축 각속도 (rad/s)
+	float gyro_y_rad_s; // 센서 Y축 각속도 (rad/s)
+	float gyro_z_rad_s; // 센서 Z축 각속도 (rad/s)
+
 	uint32_t timestamp_ms; // 마지막 정상 데이터 수신 시각
 	uint32_t sequence; // 정상 데이터 수신 순번
 	uint8_t valid; // 현재 데이터 유효 여부
 	uint8_t updated; // 새로운 데이터 갱신 여부
+	uint8_t quaternion_valid; // Quaternion 데이터 유효 여부
+	uint8_t gyro_valid; // 각속도 데이터 유효 여부
 } IMU_Data_t;
 
 // IMU UART 핸들 등록 및 내부 초기화

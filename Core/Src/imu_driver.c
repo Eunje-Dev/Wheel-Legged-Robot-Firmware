@@ -15,6 +15,14 @@
 // IMU 데이터 유효 시간
 #define IMU_STALE_TIMEOUT_MS 200U
 
+// IMU 출력 형식별 데이터 개수
+#define IMU_EULER_VALUE_COUNT 3U
+#define IMU_QUATERNION_GYRO_VALUE_COUNT 7U
+#define IMU_MAX_FRAME_VALUE_COUNT 7U
+
+// 각속도 단위 변환
+#define IMU_DEG_TO_RAD 0.01745329251994329577f
+
 // UART 핸들 저장
 static UART_HandleTypeDef *imu_huart;
 
@@ -34,9 +42,9 @@ static volatile uint32_t frame_timestamp_ms = 0;
 static volatile uint32_t dropped_frame_count = 0;
 static uint32_t parse_error_count = 0;
 
-// IMU 문자열 → roll/pitch/yaw 파싱
-static uint8_t IMU_Parse_Frame(const char *buf, float *roll, float *pitch,
-		float *yaw);
+// IMU 문자열의 실수 데이터 파싱
+static uint8_t IMU_Parse_Frame(const char *buf, float *values,
+		uint8_t *value_count);
 
 // IMU 초기화 (UART 핸들 등록)
 void IMU_Init(UART_HandleTypeDef *huart) {
@@ -83,34 +91,72 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size) {
 	}
 
 	// DMA 재시작
-	IMU_Start_DMA();
+	(void) IMU_Start_DMA();
+}
+
+// UART 수신 오류 발생 시 DMA 수신 재시작
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+	if (huart != imu_huart)
+		return;
+
+	receive_error = 1U;
+
+	// USART 오류 플래그와 남아 있는 수신 데이터 제거
+	__HAL_UART_CLEAR_FLAG(huart,
+			UART_CLEAR_PEF | UART_CLEAR_FEF | UART_CLEAR_NEF
+					| UART_CLEAR_OREF);
+	__HAL_UART_SEND_REQ(huart, UART_RXDATA_FLUSH_REQUEST);
+
+	(void) IMU_Start_DMA();
 }
 
 // 수신 데이터 파싱
 void IMU_Process_Data(void) {
+	float values[IMU_MAX_FRAME_VALUE_COUNT] = { 0 };
+	uint8_t value_count = 0U;
+
 	if (!data_ready)
 		return;
 
 	// 문자열 끝 보장
-	proc_buf[127] = '\0';
-
-	float roll, pitch, yaw;
+	proc_buf[IMU_RX_BUF_SIZE - 1U] = '\0';
 
 	// 파싱 실패 시 기존 데이터 유지
-	if (!IMU_Parse_Frame((char*) proc_buf, &roll, &pitch, &yaw)) {
+	if (!IMU_Parse_Frame((char*) proc_buf, values, &value_count)) {
 		parse_error_count++;
 		data_ready = 0;
 		return;
 	}
 
-	// 파싱 성공 시만 데이터 갱신
-	imu_data.roll = roll;
-	imu_data.pitch = pitch;
-	imu_data.yaw = yaw;
+	if (value_count == IMU_EULER_VALUE_COUNT) {
+		// Euler 출력 순서: roll, pitch, yaw
+		imu_data.roll = values[0];
+		imu_data.pitch = values[1];
+		imu_data.yaw = values[2];
+
+		imu_data.quaternion_valid = 0U;
+		imu_data.gyro_valid = 0U;
+	} else {
+		// 센서 Quaternion 출력 순서: z, y, x, w
+		imu_data.quaternion_z = values[0];
+		imu_data.quaternion_y = values[1];
+		imu_data.quaternion_x = values[2];
+		imu_data.quaternion_w = values[3];
+
+		// 센서 Gyro 출력 단위인 dps를 rad/s로 변환
+		imu_data.gyro_x_rad_s = values[4] * IMU_DEG_TO_RAD;
+		imu_data.gyro_y_rad_s = values[5] * IMU_DEG_TO_RAD;
+		imu_data.gyro_z_rad_s = values[6] * IMU_DEG_TO_RAD;
+
+		imu_data.quaternion_valid = 1U;
+		imu_data.gyro_valid = 1U;
+	}
+
+	// 파싱 성공 시 공통 상태 갱신
 	imu_data.timestamp_ms = frame_timestamp_ms;
 	imu_data.sequence++;
-	imu_data.valid = 1;
-	imu_data.updated = 1;
+	imu_data.valid = 1U;
+	imu_data.updated = 1U;
 
 	// 정상 처리 후 플래그 클리어
 	data_ready = 0;
@@ -152,40 +198,56 @@ uint32_t IMU_Get_Dropped_Frame_Count(void) {
 
 // IMU 프레임 파싱 함수
 // buf: 수신된 문자열
-// roll, pitch, yaw: 파싱 결과 저장
+// values: 파싱된 실수 데이터 저장
+// value_count: 파싱된 데이터 개수 저장
 // return: 1(성공), 0(실패)
-static uint8_t IMU_Parse_Frame(const char *buf, float *roll, float *pitch,
-		float *yaw) {
-	// '*' 기준으로 시작 위치 찾기
-	const char *start = strrchr(buf, '*');
-	if (start == NULL)
-		return 0;
-
-	const char *ptr = start + 1;
+static uint8_t IMU_Parse_Frame(const char *buf, float *values,
+		uint8_t *value_count) {
+	const char *start;
+	const char *ptr;
 	char *endptr;
+	uint8_t count = 0U;
 
-	// roll 파싱
-	*roll = strtof(ptr, &endptr);
-	if (endptr == ptr || *endptr != ',')
-		return 0;
+	// '*' 기준으로 시작 위치 찾기
+	start = strrchr(buf, '*');
+	if (start == NULL)
+		return 0U;
 
-	// pitch 파싱
-	ptr = endptr + 1;
-	*pitch = strtof(ptr, &endptr);
-	if (endptr == ptr || *endptr != ',')
-		return 0;
+	ptr = start + 1;
 
-	// yaw 파싱
-	ptr = endptr + 1;
-	*yaw = strtof(ptr, &endptr);
-	if (endptr == ptr)
-		return 0;
+	while (1) {
+		if (count >= IMU_MAX_FRAME_VALUE_COUNT)
+			return 0U;
 
-	while (*endptr == ' ' || *endptr == '\r' || *endptr == '\n')
-		endptr++;
+		values[count] = strtof(ptr, &endptr);
+		if (endptr == ptr)
+			return 0U;
 
-	if (*endptr != '\0')
-		return 0;
+		count++;
 
-	return 1;
+		while (*endptr == ' ')
+			endptr++;
+
+		if (*endptr == ',') {
+			ptr = endptr + 1;
+			continue;
+		}
+
+		while (*endptr == ' ' || *endptr == '\r' || *endptr == '\n')
+			endptr++;
+
+		if (*endptr != '\0')
+			return 0U;
+
+		break;
+	}
+
+	if (count != IMU_EULER_VALUE_COUNT
+			&& count != IMU_QUATERNION_GYRO_VALUE_COUNT) {
+		return 0U;
+	}
+
+	*value_count = count;
+
+	return 1U;
 }

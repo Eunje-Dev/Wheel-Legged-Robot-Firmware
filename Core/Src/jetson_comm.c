@@ -19,17 +19,31 @@ static char rx_line[64];
 static uint8_t rx_index = 0;
 static volatile uint8_t line_ready = 0;
 
-// 12개 MX 모터 상태 바이너리 패킷 규격
+// 12개 MX 모터와 IMU 상태 바이너리 패킷 규격
 #define JETSON_MOTOR_STATE_BIN_HEADER_0		0x57U
 #define JETSON_MOTOR_STATE_BIN_HEADER_1		0x4BU
-#define JETSON_MOTOR_STATE_BIN_VERSION		0x01U
+#define JETSON_MOTOR_STATE_BIN_VERSION		0x02U
 #define JETSON_MOTOR_STATE_BIN_TYPE		0x01U
 #define JETSON_MOTOR_STATE_BIN_HEADER_SIZE	16U
 #define JETSON_MOTOR_STATE_BIN_DATA_SIZE	10U
+#define JETSON_MOTOR_STATE_BIN_IMU_META_SIZE	9U
+#define JETSON_MOTOR_STATE_BIN_QUATERNION_SIZE	16U
+#define JETSON_MOTOR_STATE_BIN_GYRO_SIZE	12U
+#define JETSON_MOTOR_STATE_BIN_IMU_SIZE		\
+		(JETSON_MOTOR_STATE_BIN_IMU_META_SIZE \
+		+ JETSON_MOTOR_STATE_BIN_QUATERNION_SIZE \
+		+ JETSON_MOTOR_STATE_BIN_GYRO_SIZE)
 #define JETSON_MOTOR_STATE_BIN_CRC_SIZE		2U
+
+// IMU 데이터 유효성 비트
+#define JETSON_IMU_VALID_DATA			0x01U
+#define JETSON_IMU_VALID_QUATERNION		0x02U
+#define JETSON_IMU_VALID_GYRO			0x04U
+
 #define JETSON_MOTOR_STATE_BIN_PACKET_SIZE	\
 		(JETSON_MOTOR_STATE_BIN_HEADER_SIZE \
 		+ (DXL_LEG_MOTOR_COUNT * JETSON_MOTOR_STATE_BIN_DATA_SIZE) \
+		+ JETSON_MOTOR_STATE_BIN_IMU_SIZE \
 		+ JETSON_MOTOR_STATE_BIN_CRC_SIZE)
 
 // 모터 상태 스트리밍 주기
@@ -78,6 +92,15 @@ static void Jetson_Write_U32_LE(uint8_t *buffer, uint16_t *index,
 	buffer[(*index)++] = (uint8_t) ((value >> 8) & 0xFFU);
 	buffer[(*index)++] = (uint8_t) ((value >> 16) & 0xFFU);
 	buffer[(*index)++] = (uint8_t) ((value >> 24) & 0xFFU);
+}
+
+// 32비트 float 값을 IEEE-754 Little Endian 순서로 저장
+static void Jetson_Write_F32_LE(uint8_t *buffer, uint16_t *index,
+		float value) {
+	uint32_t raw_value = 0U;
+
+	memcpy(&raw_value, &value, sizeof(raw_value));
+	Jetson_Write_U32_LE(buffer, index, raw_value);
 }
 
 // 바이너리 패킷 CRC-16/CCITT-FALSE 계산
@@ -190,11 +213,13 @@ static void Jetson_Send_All_Motor_State(void) {
 	Jetson_Send_Text("\r\n");
 }
 
-// 12개 다리 모터 전체 상태 바이너리 송신
+// 12개 다리 모터와 IMU 전체 상태 바이너리 송신
 static void Jetson_Send_All_Motor_State_Binary(void) {
 	DXL_Leg_State_t state;
+	IMU_Data_t imu_data;
 	uint16_t tx_index = 0U;
 	uint16_t crc;
+	uint8_t imu_valid_flags;
 	uint32_t total_start_cycle;
 	uint32_t sync_read_end_cycle;
 	uint32_t packet_build_end_cycle;
@@ -227,6 +252,22 @@ static void Jetson_Send_All_Motor_State_Binary(void) {
 		return;
 	}
 
+	// 모터 상태와 함께 전송할 최신 IMU 데이터 저장
+	imu_data = IMU_Get_Latest_Data();
+	imu_valid_flags = 0U;
+
+	if (imu_data.valid != 0U) {
+		imu_valid_flags |= JETSON_IMU_VALID_DATA;
+	}
+
+	if (imu_data.quaternion_valid != 0U) {
+		imu_valid_flags |= JETSON_IMU_VALID_QUATERNION;
+	}
+
+	if (imu_data.gyro_valid != 0U) {
+		imu_valid_flags |= JETSON_IMU_VALID_GYRO;
+	}
+
 	// 패킷 Header와 기본 정보 저장
 	jetson_motor_state_tx_packet[tx_index++] =
 			JETSON_MOTOR_STATE_BIN_HEADER_0;
@@ -257,6 +298,31 @@ static void Jetson_Send_All_Motor_State_Binary(void) {
 		Jetson_Write_U16_LE(jetson_motor_state_tx_packet, &tx_index,
 				(uint16_t) motor->current_raw);
 	}
+
+	// IMU 수신 순번, 수신 시각과 유효성 저장
+	Jetson_Write_U32_LE(jetson_motor_state_tx_packet, &tx_index,
+			imu_data.sequence);
+	Jetson_Write_U32_LE(jetson_motor_state_tx_packet, &tx_index,
+			imu_data.timestamp_ms);
+	jetson_motor_state_tx_packet[tx_index++] = imu_valid_flags;
+
+	// Quaternion 순서: X, Y, Z, W
+	Jetson_Write_F32_LE(jetson_motor_state_tx_packet, &tx_index,
+			imu_data.quaternion_x);
+	Jetson_Write_F32_LE(jetson_motor_state_tx_packet, &tx_index,
+			imu_data.quaternion_y);
+	Jetson_Write_F32_LE(jetson_motor_state_tx_packet, &tx_index,
+			imu_data.quaternion_z);
+	Jetson_Write_F32_LE(jetson_motor_state_tx_packet, &tx_index,
+			imu_data.quaternion_w);
+
+	// 센서 좌표계 각속도 순서: X, Y, Z (rad/s)
+	Jetson_Write_F32_LE(jetson_motor_state_tx_packet, &tx_index,
+			imu_data.gyro_x_rad_s);
+	Jetson_Write_F32_LE(jetson_motor_state_tx_packet, &tx_index,
+			imu_data.gyro_y_rad_s);
+	Jetson_Write_F32_LE(jetson_motor_state_tx_packet, &tx_index,
+			imu_data.gyro_z_rad_s);
 
 	// CRC를 제외한 길이가 정확한지 확인
 	if (tx_index
