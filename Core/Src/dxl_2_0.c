@@ -18,7 +18,6 @@ static uint8_t dxl_tx_buffer[256];
 #define DXL_SYNC_READ_RX_BUFFER_SIZE         320U
 #define DXL_SYNC_READ_STATUS_PACKET_MAX_SIZE 32U
 #define DXL_SYNC_READ_TIMEOUT_MS             10U
-#define DXL_SYNC_READ_IDLE_TIME_MS           3U
 
 static uint8_t dxl_sync_read_rx_buffer[DXL_SYNC_READ_RX_BUFFER_SIZE];
 
@@ -684,7 +683,6 @@ uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state) {
 	uint16_t received_length = 0U;
 	uint16_t previous_received_length = 0U;
 	uint32_t start_tick;
-	uint32_t last_activity_tick;
 	uint32_t primask;
 	HAL_StatusTypeDef dma_status;
 	HAL_StatusTypeDef tx_status;
@@ -742,6 +740,9 @@ uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state) {
 					| UART_CLEAR_PEF | UART_CLEAR_FEF);
 	__HAL_UART_SEND_REQ(&huart6, UART_RXDATA_FLUSH_REQUEST);
 
+	// 수신 오류가 발생해도 USART6 RX DMA가 계속 동작하도록 설정
+	CLEAR_BIT(huart6.Instance->CR3, USART_CR3_DDRE);
+
 	// 첫 번째 모터 응답을 놓치지 않도록 송신 전에 RX DMA 시작
 	dma_status = HAL_UART_Receive_DMA(&huart6,
 			dxl_sync_read_rx_buffer, DXL_SYNC_READ_RX_BUFFER_SIZE);
@@ -750,6 +751,9 @@ uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state) {
 		state->timestamp_ms = HAL_GetTick();
 		return 0U;
 	}
+
+	// 일시적인 USART6 오류로 HAL이 RX DMA 전체를 중단하지 않도록 설정
+	__HAL_UART_DISABLE_IT(&huart6, UART_IT_ERR);
 
 	// 절반 수신 인터럽트는 사용하지 않음
 	__HAL_DMA_DISABLE_IT(huart6.hdmarx, DMA_IT_HT);
@@ -767,25 +771,25 @@ uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state) {
 	}
 
 	start_tick = HAL_GetTick();
-	last_activity_tick = start_tick;
 
-	// DMA 수신량이 1ms 동안 증가하지 않거나 전체 Timeout까지 대기
+	// 12개 Status Packet 검증 완료 또는 전체 Timeout까지 대기
 	while ((HAL_GetTick() - start_tick) < DXL_SYNC_READ_TIMEOUT_MS) {
 		received_length = (uint16_t) (DXL_SYNC_READ_RX_BUFFER_SIZE
 				- __HAL_DMA_GET_COUNTER(huart6.hdmarx));
 
 		if (received_length != previous_received_length) {
 			previous_received_length = received_length;
-			last_activity_tick = HAL_GetTick();
+
+			// 현재까지 완전히 수신된 Status Packet 검사
+			__DMB();
+			DXL_Sync_Read_Parse_Stream(received_length, state);
+
+			if (state->received_count >= DXL_LEG_MOTOR_COUNT) {
+				break;
+			}
 		}
 
 		if (received_length >= DXL_SYNC_READ_RX_BUFFER_SIZE) {
-			break;
-		}
-
-		if (received_length > 0U
-				&& (HAL_GetTick() - last_activity_tick)
-						>= DXL_SYNC_READ_IDLE_TIME_MS) {
 			break;
 		}
 	}
