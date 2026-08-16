@@ -32,6 +32,9 @@ static volatile uint8_t line_ready = 0;
 		+ (DXL_LEG_MOTOR_COUNT * JETSON_MOTOR_STATE_BIN_DATA_SIZE) \
 		+ JETSON_MOTOR_STATE_BIN_CRC_SIZE)
 
+// 모터 상태 스트리밍 주기
+#define JETSON_MOTOR_STATE_STREAM_PERIOD_MS	10U
+
 // 모터 상태 바이너리 DMA 송신 버퍼와 상태
 static uint8_t jetson_motor_state_tx_packet[
 		JETSON_MOTOR_STATE_BIN_PACKET_SIZE];
@@ -47,6 +50,13 @@ static volatile uint32_t jetson_motor_state_cpu_active_us = 0U;
 static volatile uint32_t jetson_motor_state_uart_tx_us = 0U;
 static volatile uint32_t jetson_motor_state_total_us = 0U;
 static volatile HAL_StatusTypeDef jetson_motor_state_tx_status = HAL_ERROR;
+
+// 모터 상태 스트리밍 상태와 진단값
+static volatile uint8_t jetson_motor_state_stream_enabled = 0U;
+static uint32_t jetson_motor_state_stream_next_tick = 0U;
+static volatile uint32_t jetson_motor_state_stream_packet_count = 0U;
+static volatile uint32_t jetson_motor_state_stream_busy_count = 0U;
+static volatile uint32_t jetson_motor_state_stream_missed_count = 0U;
 
 // Jetson 문자열 송신
 static void Jetson_Send_Text(const char *text) {
@@ -320,6 +330,107 @@ static void Jetson_Send_Motor_State_Timing(void) {
 	}
 }
 
+// 모터 상태 100Hz 스트리밍 실행
+static void Jetson_Motor_State_Stream_Task(void) {
+	uint32_t current_tick;
+	uint32_t elapsed_ms;
+	uint32_t missed_periods;
+
+	if (jetson_motor_state_stream_enabled == 0U) {
+		return;
+	}
+
+	current_tick = HAL_GetTick();
+
+	// 다음 송신 시각에 도달하지 않은 경우 대기
+	if ((int32_t) (current_tick
+			- jetson_motor_state_stream_next_tick) < 0) {
+		return;
+	}
+
+	elapsed_ms = current_tick
+			- jetson_motor_state_stream_next_tick;
+	missed_periods = elapsed_ms
+			/ JETSON_MOTOR_STATE_STREAM_PERIOD_MS;
+
+	// 처리 지연으로 지나간 주기는 다시 몰아서 실행하지 않음
+	if (missed_periods > 0U) {
+		jetson_motor_state_stream_missed_count += missed_periods;
+	}
+
+	jetson_motor_state_stream_next_tick +=
+			(missed_periods + 1U)
+					* JETSON_MOTOR_STATE_STREAM_PERIOD_MS;
+
+	Jetson_Send_All_Motor_State_Binary();
+
+	if (jetson_motor_state_tx_status == HAL_OK) {
+		jetson_motor_state_stream_packet_count++;
+	} else if (jetson_motor_state_tx_status == HAL_BUSY) {
+		jetson_motor_state_stream_busy_count++;
+	}
+}
+
+// 진행 중인 모터 상태 DMA 송신 완료 대기
+static uint8_t Jetson_Wait_Motor_State_Tx_Complete(
+		uint32_t timeout_ms) {
+	uint32_t start_tick = HAL_GetTick();
+
+	while (jetson_motor_state_tx_busy != 0U) {
+		if ((HAL_GetTick() - start_tick) >= timeout_ms) {
+			return 0U;
+		}
+	}
+
+	return 1U;
+}
+
+// 모터 상태 스트리밍 시작
+static void Jetson_Start_Motor_State_Stream(void) {
+	if (!Jetson_Wait_Motor_State_Tx_Complete(10U)) {
+		Jetson_Send_Text(
+				"MOTOR_STATE_STREAM:START_FAILED,REASON=TX_BUSY\r\n");
+		return;
+	}
+
+	jetson_motor_state_stream_packet_count = 0U;
+	jetson_motor_state_stream_busy_count = 0U;
+	jetson_motor_state_stream_missed_count = 0U;
+
+	Jetson_Send_Text(
+			"MOTOR_STATE_STREAM:STARTED,PERIOD_MS=10\r\n");
+
+	jetson_motor_state_stream_next_tick =
+			HAL_GetTick()
+					+ JETSON_MOTOR_STATE_STREAM_PERIOD_MS;
+	jetson_motor_state_stream_enabled = 1U;
+}
+
+// 모터 상태 스트리밍 정지
+static void Jetson_Stop_Motor_State_Stream(void) {
+	char tx_line[128];
+	int length;
+
+	jetson_motor_state_stream_enabled = 0U;
+
+	if (!Jetson_Wait_Motor_State_Tx_Complete(10U)) {
+		Jetson_Send_Text(
+				"MOTOR_STATE_STREAM:STOP_FAILED,REASON=TX_BUSY\r\n");
+		return;
+	}
+
+	length = snprintf(tx_line, sizeof(tx_line),
+			"MOTOR_STATE_STREAM:STOPPED,"
+			"PACKETS=%lu,BUSY=%lu,MISSED=%lu\r\n",
+			(unsigned long) jetson_motor_state_stream_packet_count,
+			(unsigned long) jetson_motor_state_stream_busy_count,
+			(unsigned long) jetson_motor_state_stream_missed_count);
+
+	if (length > 0 && length < (int) sizeof(tx_line)) {
+		Jetson_Send_Text(tx_line);
+	}
+}
+
 // 현재 모터 속도 송신
 static void Jetson_Send_Motor_Velocity(const char *id_text) {
 	char *end_ptr;
@@ -553,6 +664,12 @@ void Jetson_Comm_Init(UART_HandleTypeDef *huart) {
 	rx_index = 0;
 	line_ready = 0;
 
+	jetson_motor_state_stream_enabled = 0U;
+	jetson_motor_state_stream_next_tick = 0U;
+	jetson_motor_state_stream_packet_count = 0U;
+	jetson_motor_state_stream_busy_count = 0U;
+	jetson_motor_state_stream_missed_count = 0U;
+
 	// 통신 소요시간 측정을 위한 CPU Cycle Counter 활성화
 	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
 	DWT->LAR = 0xC5ACCE55UL;
@@ -622,6 +739,7 @@ void Jetson_Comm_Task(void) {
 	char command[sizeof(rx_line)];
 
 	if (!line_ready) {
+		Jetson_Motor_State_Stream_Task();
 		return;
 	}
 
@@ -634,6 +752,12 @@ void Jetson_Comm_Task(void) {
 		Jetson_Send_Text("OK\r\n");
 	} else if (strcmp(command, "GET_IMU") == 0) {
 		Jetson_Send_IMU();
+	} else if (strcmp(command,
+			"START_MOTOR_STATE_STREAM") == 0) {
+		Jetson_Start_Motor_State_Stream();
+	} else if (strcmp(command,
+			"STOP_MOTOR_STATE_STREAM") == 0) {
+		Jetson_Stop_Motor_State_Stream();
 	} else if (strcmp(command, "GET_MOTOR_STATE_BIN") == 0) {
 		Jetson_Send_All_Motor_State_Binary();
 	} else if (strcmp(command, "GET_MOTOR_STATE_TIMING") == 0) {
