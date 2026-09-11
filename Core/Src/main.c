@@ -51,7 +51,6 @@
 IMU_Data_t g_imu_data;               // 최신 IMU 데이터
 volatile uint8_t user_stop_flag = 0;   // USER 버튼 눌림 여부 (1이면 모터 정지)
 volatile uint8_t mode_button_request = 0;
-static uint8_t user_button_step = 0;	// USER 버튼 시험 동작 순서
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -156,42 +155,23 @@ int main(void)
 	while (1) {
 		IMU_Task();
 		Jetson_Comm_Task();
+		Robot_Ramp_Control_Task();
+		Robot_Walk_Demo_Task();
+		Robot_Wheel_Drive_Task();
 
 		if (mode_button_request) {
 			mode_button_request = 0;
+			Jetson_Comm_DiscardPendingCommands(); // 버튼 동작 전 대기 중인 명령 폐기
 
-			switch (user_button_step) {
-
-			case 0:
+			if (Robot_Get_Mode() == MODE_WHEEL) {
 				// 첫 번째 입력: Wheel → Leg
 				Robot_Set_Leg_Mode();
-				user_button_step = 1;
-				break;
-
-			case 1:
-				// 두 번째 입력: Leg → Wheel
-				Robot_Set_Wheel_Mode();
-				user_button_step = 2;
-				break;
-
-			case 2:
-				// 세 번째 입력: Wheel Mode 전진
-				if (Robot_Get_Mode() == MODE_WHEEL) {
-					Robot_Wheel_Forward();
-					user_button_step = 3;
-				}
-				break;
-
-			case 3:
-				// 네 번째 입력: 바퀴 정지 후 처음 순서로 복귀
-				Robot_Wheel_Stop();
-				user_button_step = 0;
-				break;
-
-			default:
-				Robot_Wheel_Stop();
-				user_button_step = 0;
-				break;
+			} else if (Robot_Get_Mode() == MODE_LEG) {
+				// 두 번째 입력: 촬영용 3스텝 시작
+				Robot_Start_Walk_Demo();
+			} else if (Robot_Get_Mode() == MODE_WALK_DEMO) {
+				// 보행 중 입력: 현재 자세 유지
+				Robot_Stop_Walk_Demo();
 			}
 
 			// 동작 중 발생한 추가 버튼 입력 제거

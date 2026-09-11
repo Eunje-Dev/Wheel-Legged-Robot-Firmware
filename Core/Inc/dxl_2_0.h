@@ -46,6 +46,14 @@ enum DxlInst {
 // [Protocol 2.0] MX-106, MX-64 컨트롤 테이블 (다리 관절용)
 // 통신: UART6 (2Mbps)
 enum Dxl_2_0_Addr {
+	DXL_2_Operating_Mode = 11,      // 운전 모드 (1바이트)
+	DXL_2_Temperature_Limit = 31,   // 최대 온도 제한 (1바이트)
+	DXL_2_PWM_Limit = 36,           // 최대 PWM 제한 (2바이트)
+	DXL_2_Current_Limit = 38,       // 최대 전류 제한 (2바이트)
+	DXL_2_Velocity_Limit = 44,      // 최대 속도 제한 (4바이트)
+	DXL_2_Max_Position_Limit = 48,  // 최대 위치 제한 (4바이트)
+	DXL_2_Min_Position_Limit = 52,  // 최소 위치 제한 (4바이트)
+	DXL_2_Shutdown = 63,            // 오류 시 토크 차단 조건 (1바이트)
 	DXL_2_Torque_Enable = 64,      // 토크 ON/OFF (1: ON, 0: OFF)
 	DXL_2_LED = 65,                // LED 제어
 	DXL_2_Status_Return_Level = 68, // 응답레벨
@@ -53,6 +61,9 @@ enum Dxl_2_0_Addr {
 	DXL_2_Position_D_Gain = 80,     // 위치 제어 D Gain
 	DXL_2_Position_I_Gain = 82,     // 위치 제어 I Gain
 	DXL_2_Position_P_Gain = 84,     // 위치 제어 P Gain
+	DXL_2_Feedforward_2nd_Gain = 88, // 2차 피드포워드 게인
+	DXL_2_Feedforward_1st_Gain = 90, // 1차 피드포워드 게인
+	DXL_2_Bus_Watchdog = 98,        // 통신 감시 시간 (1바이트)
 	DXL_2_Goal_PWM = 100,           // 목표 PWM 값
 	DXL_2_Profile_Acceleration = 108, // 프로파일 가속도
 	DXL_2_Profile_Velocity = 112,  // 프로파일 속도
@@ -195,6 +206,10 @@ uint8_t dxl_read_2_0(uint8_t id, uint16_t addr, uint16_t data_len,
 // 12개 다리 모터 현재 상태 Sync Read
 uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state);
 
+// 메인 루프에서 최근 모터 조회 결과 재사용
+// 조회 시각·실패·부분 수신 상태 유지, 유효 시간 초과 시 재조회
+uint16_t dxl_get_recent_leg_state(DXL_Leg_State_t *state, uint32_t max_age_ms);
+
 // 동기화 제어 함수 (Sync Write)
 void send_sync_write_1(uint16_t addr, uint16_t data_len, int16_t *wheel_data);
 
@@ -213,6 +228,10 @@ void dxl_sync_write_1byte(uint8_t *ids, uint8_t *values, uint8_t count,
 // Protocol 2.0 Sync Write 4바이트 (여러 모터 동시 제어)
 void dxl_sync_write_4byte(uint8_t *ids, uint32_t *values, uint8_t count,
 		uint16_t addr);
+
+// 경사로 목표 위치 검사·전송, 모터 응답 확인과 별도
+uint8_t dxl_sync_write_goal_positions_checked(const uint8_t *ids,
+        const uint32_t *values, uint8_t count);
 
 // Dynamixel 패킷 전송 함수 (USART1 바퀴, USART6 다리)
 HAL_StatusTypeDef uart_transmit_packet(UART_HandleTypeDef *huart,

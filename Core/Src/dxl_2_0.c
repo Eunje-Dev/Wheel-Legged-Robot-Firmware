@@ -31,6 +31,10 @@ static const uint8_t dxl_leg_motor_ids[DXL_LEG_MOTOR_COUNT] = {
 
 static uint32_t dxl_leg_state_sequence = 0U;
 
+// 메인 루프용 최근 모터 조회 결과 저장 (부분 수신·실패 포함)
+static DXL_Leg_State_t dxl_recent_leg_state;
+static uint8_t dxl_recent_leg_state_available = 0U;
+
 // 메인 루프에서 정의된 UART 핸들 참조
 extern UART_HandleTypeDef huart1; // 바퀴(AX, 1Mbps) 제어용
 extern UART_HandleTypeDef huart3; // Jetson VCP 통신용
@@ -675,7 +679,7 @@ uint8_t dxl_read_2_0(uint8_t id, uint16_t addr, uint16_t data_len,
 }
 
 // 12개 다리 모터 Current, Velocity, Position Sync Read
-uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state) {
+static uint16_t DXL_Sync_Read_Leg_State_Uncached(DXL_Leg_State_t *state) {
 	uint8_t tx_packet[32];
 	uint16_t tx_index = 0U;
 	uint16_t packet_length;
@@ -806,6 +810,38 @@ uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state) {
 	state->timestamp_ms = HAL_GetTick();
 
 	return state->valid_mask;
+}
+
+// 12개 다리 모터 Current, Velocity, Position Sync Read
+uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state) {
+	uint16_t valid_mask;
+
+	if (state == NULL) {
+		return 0U;
+	}
+
+	valid_mask = DXL_Sync_Read_Leg_State_Uncached(state);
+	// 조회 실패 시에도 최근 결과 갱신
+	dxl_recent_leg_state = *state;
+	dxl_recent_leg_state_available = 1U;
+	return valid_mask;
+}
+
+// 메인 루프에서 최근 조회 결과 재사용, 유효 시간 0이면 새로 조회
+uint16_t dxl_get_recent_leg_state(DXL_Leg_State_t *state, uint32_t max_age_ms) {
+	if (state == NULL) {
+		return 0U;
+	}
+
+	if (dxl_recent_leg_state_available != 0U
+			&& (uint32_t) (HAL_GetTick() - dxl_recent_leg_state.timestamp_ms)
+					< max_age_ms) {
+		// 조회 시각·순번·유효성 유지
+		*state = dxl_recent_leg_state;
+		return state->valid_mask;
+	}
+
+	return dxl_sync_read_leg_state(state);
 }
 
 // Protocol 2.0 개별 Ping (다리용, UART6)
@@ -1022,8 +1058,8 @@ void dxl_sync_write_1byte(uint8_t *ids, uint8_t *values, uint8_t count,
 }
 
 // Protocol 2.0 Sync Write 4바이트 (여러 모터 동시 제어)
-void dxl_sync_write_4byte(uint8_t *ids, uint32_t *values, uint8_t count,
-		uint16_t addr) {
+static uint8_t DXL_Sync_Write_4byte_Checked(const uint8_t *ids,
+        const uint32_t *values, uint8_t count, uint16_t addr) {
 	uint8_t tx_packet[256];
 	uint16_t idx = 0;
 	uint16_t length;
@@ -1032,15 +1068,15 @@ void dxl_sync_write_4byte(uint8_t *ids, uint32_t *values, uint8_t count,
 
 	// 입력값 유효성 검사
 	if (ids == NULL || values == NULL || count == 0) {
-		return;
+		return 0U;
 	}
 
 	// 패킷 길이 계산
 	length = 7 + (count * 5);
 
 	// 패킷 버퍼 초과 방지
-	if ((length + 7) > sizeof(tx_packet)) {
-		return;
+	if (((uint32_t) length + 7U) > sizeof(tx_packet)) {
+		return 0U;
 	}
 
 	// 패킷 헤더
@@ -1082,5 +1118,27 @@ void dxl_sync_write_4byte(uint8_t *ids, uint32_t *values, uint8_t count,
 	tx_packet[idx++] = (crc >> 8) & 0xFF;
 
 	// UART6로 패킷 전송
-	uart_transmit_packet(&huart6, tx_packet, idx);
+	return uart_transmit_packet(&huart6, tx_packet, idx) == HAL_OK ? 1U : 0U;
+}
+
+void dxl_sync_write_4byte(uint8_t *ids, uint32_t *values, uint8_t count,
+        uint16_t addr)
+{
+    // Protocol 2.0 Sync Write 4바이트 (여러 모터 동시 제어)
+    (void) DXL_Sync_Write_4byte_Checked(ids, values, count, addr);
+}
+
+uint8_t dxl_sync_write_goal_positions_checked(const uint8_t *ids,
+        const uint32_t *values, uint8_t count)
+{
+    uint8_t i, j;
+    if (ids == NULL || values == NULL || count == 0U || count > DXL_LEG_MOTOR_COUNT)
+        return 0U;
+    for (i = 0U; i < count; ++i) {
+        if (ids[i] == 0U || ids[i] >= 0xFDU || values[i] > 4095U) return 0U;
+        for (j = 0U; j < i; ++j) if (ids[i] == ids[j]) return 0U;
+    }
+    // 단일 회전 목표 범위로 바이트 삽입 불필요
+    // 반환값은 송신 결과, 모터 응답·동작 확인과 별도
+    return DXL_Sync_Write_4byte_Checked(ids, values, count, DXL_2_Goal_Position);
 }

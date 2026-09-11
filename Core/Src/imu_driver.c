@@ -6,6 +6,8 @@
  */
 #include <stdio.h>
 #include "imu_driver.h"
+#include "jetson_comm.h"
+#include <math.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -58,9 +60,8 @@ HAL_StatusTypeDef IMU_Start_DMA(void) {
 
 	if (status == HAL_OK) {
 		__HAL_DMA_DISABLE_IT(imu_huart->hdmarx, DMA_IT_HT);
-		receive_error = 0;
 	} else {
-		receive_error = 1;
+		receive_error = 1U;
 	}
 
 	return status;
@@ -96,6 +97,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size) {
 
 // UART 수신 오류 발생 시 DMA 수신 재시작
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+	if (Jetson_Comm_HandleUartError(huart)) return;
 	if (huart != imu_huart)
 		return;
 
@@ -158,13 +160,43 @@ void IMU_Process_Data(void) {
 	imu_data.valid = 1U;
 	imu_data.updated = 1U;
 
+	// 정상 데이터 수신·해석 후 통신 오류 해제
+	receive_error = 0U;
+
 	// 정상 처리 후 플래그 클리어
 	data_ready = 0;
+}
+
+// 쿼터니언 정규화 및 자세각 변환
+// 원본 데이터·부호·영점·수신 시각 유지
+static uint8_t IMU_UpdateEulerView(IMU_Data_t *data)
+{
+    float x = data->quaternion_x, y = data->quaternion_y;
+    float z = data->quaternion_z, w = data->quaternion_w;
+    const float norm_sq = x*x + y*y + z*z + w*w;
+    float sin_pitch, inverse_norm;
+    if (!isfinite(norm_sq) || norm_sq < 1.0e-12f) return 0U;
+    inverse_norm = 1.0f / sqrtf(norm_sq);
+    x *= inverse_norm; y *= inverse_norm;
+    z *= inverse_norm; w *= inverse_norm;
+    data->roll = atan2f(2.0f*(w*x + y*z), 1.0f - 2.0f*(x*x + y*y))
+            * 57.29577951308232088f;
+    sin_pitch = 2.0f*(w*y - z*x);
+    if (sin_pitch > 1.0f) sin_pitch = 1.0f;
+    else if (sin_pitch < -1.0f) sin_pitch = -1.0f;
+    data->pitch = asinf(sin_pitch) * 57.29577951308232088f;
+    data->yaw = atan2f(2.0f*(w*z + x*y), 1.0f - 2.0f*(y*y + z*z))
+            * 57.29577951308232088f;
+    return (isfinite(data->roll) && isfinite(data->pitch)
+            && isfinite(data->yaw)) ? 1U : 0U;
 }
 
 // 갱신 상태를 변경하지 않고 최신 데이터 반환
 IMU_Data_t IMU_Get_Latest_Data(void) {
 	IMU_Data_t data = imu_data;
+
+	if (data.quaternion_valid && !IMU_UpdateEulerView(&data))
+		data.valid = 0U;
 
 	if (receive_error)
 		data.valid = 0;
