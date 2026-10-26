@@ -6,10 +6,18 @@
 #include "dxl_2_0.h"
 #include "stdint.h"
 #include "usart.h"
+#include "woki_joint_config.h"
+#include "woki_power_guard.h"
 #include <stdbool.h>
+#include <string.h>
 
 // 송신 상태 플래그
 volatile uint8_t uart_tx_busy = 0;
+
+// 관절각 기준·기구 한계·시작 자세 확인 전에는 다리 목표 위치 송신 차단
+volatile uint8_t dxl_knee_position_status = DXL_KNEE_POSITION_LOCKED;
+extern volatile uint8_t user_stop_flag;
+
 
 // 송신 버퍼 (CPU 직접 접근용)
 static uint8_t dxl_tx_buffer[256];
@@ -20,6 +28,9 @@ static uint8_t dxl_tx_buffer[256];
 #define DXL_SYNC_READ_TIMEOUT_MS             10U
 
 static uint8_t dxl_sync_read_rx_buffer[DXL_SYNC_READ_RX_BUFFER_SIZE];
+_Static_assert(DXL_SYNC_READ_RX_BUFFER_SIZE == DXL_SYNC_DIAG_RX_CAPACITY,
+		"Sync Read diagnostic buffer size mismatch");
+static DXL_Sync_Read_Diagnostics_t dxl_last_sync_diagnostics;
 
 // 다리 모터 상태 배열 순서
 static const uint8_t dxl_leg_motor_ids[DXL_LEG_MOTOR_COUNT] = {
@@ -239,14 +250,17 @@ static uint8_t DXL_Sync_Read_Parse_Status_Packet(const uint8_t *packet,
 
 // DMA 수신 버퍼에서 여러 Status Packet 검색
 static void DXL_Sync_Read_Parse_Stream(uint16_t received_length,
-		DXL_Leg_State_t *state) {
-	uint16_t buffer_index = 0U;
+		DXL_Leg_State_t *state, uint16_t *parse_index) {
+	uint16_t buffer_index;
 	uint16_t packet_length;
 	uint16_t total_length;
 
-	if (state == NULL || received_length == 0U) {
+	if (state == NULL || parse_index == NULL || received_length == 0U) {
 		return;
 	}
+
+	// 이전에 검사가 끝난 위치부터 새 수신 데이터만 확인
+	buffer_index = *parse_index;
 
 	if (received_length > DXL_SYNC_READ_RX_BUFFER_SIZE) {
 		received_length = DXL_SYNC_READ_RX_BUFFER_SIZE;
@@ -290,6 +304,9 @@ static void DXL_Sync_Read_Parse_Stream(uint16_t received_length,
 			buffer_index++;
 		}
 	}
+
+	// 미완성 패킷은 현재 위치를 유지하여 다음 수신 때 다시 확인
+	*parse_index = buffer_index;
 }
 
 // Sync Write 패킷 구조체 초기화 (P1.0 - 바퀴)
@@ -301,6 +318,74 @@ dxl_sync_write_1_0 creat_sync_packet_1_0(void) {
 	sw1.inst = 0x83; // Sync Write Instruction
 	return sw1;
 }
+
+// 인터럽트 차단 중에도 CPU Cycle Counter로 송신 시간 제한 유지
+static HAL_StatusTypeDef DXL_UART_Transmit_Cycle_Timeout(
+		UART_HandleTypeDef *huart, const uint8_t *data, uint16_t size) {
+	uint32_t start_cycle;
+	uint32_t timeout_cycles;
+	const uint8_t *data8 = data;
+	const uint16_t *data16 = NULL;
+	HAL_StatusTypeDef status = HAL_OK;
+
+	if (huart->gState != HAL_UART_STATE_READY) {
+		return HAL_BUSY;
+	}
+	if (data == NULL || size == 0U || SystemCoreClock == 0U) {
+		return HAL_ERROR;
+	}
+
+	// 기존 소요시간 측정 Counter는 초기화하지 않음
+	if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0U) {
+		CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+		DWT->LAR = 0xC5ACCE55UL;
+		DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+	}
+	if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0U) {
+		return HAL_ERROR;
+	}
+
+	// 전체 송신과 마지막 Stop Bit 완료까지 기존 20ms 제한 적용
+	timeout_cycles = (uint32_t) ((uint64_t) SystemCoreClock * 20U / 1000U);
+	start_cycle = DWT->CYCCNT;
+	huart->ErrorCode = HAL_UART_ERROR_NONE;
+	huart->gState = HAL_UART_STATE_BUSY_TX;
+	huart->TxXferSize = size;
+	huart->TxXferCount = size;
+
+	if (huart->Init.WordLength == UART_WORDLENGTH_9B
+			&& huart->Init.Parity == UART_PARITY_NONE) {
+		data16 = (const uint16_t *) data;
+	}
+
+	while (huart->TxXferCount > 0U) {
+		while (__HAL_UART_GET_FLAG(huart, UART_FLAG_TXE) == RESET) {
+			if ((uint32_t) (DWT->CYCCNT - start_cycle) >= timeout_cycles) {
+				status = HAL_TIMEOUT;
+				goto tx_complete;
+			}
+		}
+		if (data16 != NULL) {
+			huart->Instance->TDR = (uint16_t) (*data16++ & 0x01FFU);
+		} else {
+			huart->Instance->TDR = *data8++;
+		}
+		huart->TxXferCount--;
+	}
+
+	while (__HAL_UART_GET_FLAG(huart, UART_FLAG_TC) == RESET) {
+		if ((uint32_t) (DWT->CYCCNT - start_cycle) >= timeout_cycles) {
+			status = HAL_TIMEOUT;
+			break;
+		}
+	}
+
+tx_complete:
+	// 정상·Timeout 모두 다음 송신이 가능하도록 상태 복구
+	huart->gState = HAL_UART_STATE_READY;
+	return status;
+}
+
 
 // UART 패킷 전송 및 TX Enable 제어 (USART1/USART6 분기)
 HAL_StatusTypeDef uart_transmit_packet(UART_HandleTypeDef *huart,
@@ -322,15 +407,14 @@ HAL_StatusTypeDef uart_transmit_packet(UART_HandleTypeDef *huart,
 	// (선택) EN 안정화용 짧은 지연
 	// for (volatile int i = 0; i < 50; i++) { __NOP(); }
 
-	// 2) 데이터 전송 (Timeout 20ms)
-	tx_status = HAL_UART_Transmit(huart, data, size, 20);
-
-	// 3) 전송 완료(TC)까지 대기 (마지막 stop bit까지)
-	if (tx_status == HAL_OK) {
-		while (__HAL_UART_GET_FLAG(huart, UART_FLAG_TC) == RESET) {
-			;
-		}
+	// 2) 데이터 전송, 인터럽트 차단 중에는 독립 Counter 사용
+	if (__get_PRIMASK() != 0U) {
+		tx_status = DXL_UART_Transmit_Cycle_Timeout(huart, data, size);
+	} else {
+		tx_status = HAL_UART_Transmit(huart, data, size, 20U);
 	}
+
+	// 3) 각 송신 함수에서 마지막 Stop Bit 완료(TC)까지 확인
 
 	// 4) TX Disable (버스 반환)
 	if (huart->Instance == USART1) {
@@ -344,6 +428,12 @@ HAL_StatusTypeDef uart_transmit_packet(UART_HandleTypeDef *huart,
 
 // Sync Write 전송 - Protocol 1.0 (바퀴 제어용, UART1 유지)
 void send_sync_write_1(uint16_t addr, uint16_t data_len, int16_t *wheel_data) {
+	if (wheel_data == NULL) return;
+	// 잠금·주차 중 비영 속도와 바퀴 토크 재인가는 차단, 정지·토크 OFF는 항상 허용
+	if (!RobotPower_MotionAllowed()
+			&& (addr == DXL_1_MOVING_SPEED || addr == DXL_1_Torque_Enable)) {
+		for (uint8_t i = 0U; i < 4U; ++i) if (wheel_data[i] != 0) return;
+	}
 	uint8_t id_count = 4;
 	uint8_t id[4];
 	uint16_t data_array[4];
@@ -427,6 +517,8 @@ uint16_t clc_speed_1(int16_t wheel_speed) {
 
 // Protocol 1.0 개별 Write (바퀴용, UART1 유지)
 void dxl_write_1_0(uint8_t id, uint8_t addr, uint8_t data_len, uint16_t data) {
+	if (!RobotPower_MotionAllowed() && data != 0U
+			&& (addr == DXL_1_MOVING_SPEED || addr == DXL_1_Torque_Enable)) return;
 	uint8_t idx = 0;
 	dxl_tx_buffer[idx++] = 0xFF;
 	dxl_tx_buffer[idx++] = 0xFF;
@@ -451,6 +543,21 @@ void dxl_write_1_0(uint8_t id, uint8_t addr, uint8_t data_len, uint16_t data) {
 
 // Protocol 2.0 개별 Write (다리용, UART6로 변경)
 void dxl_write_2_0(uint8_t id, uint16_t addr, uint8_t data_len, uint32_t data) {
+    if (addr == DXL_2_Goal_Position) {
+        if (data_len != 4U || !WokiJoint_PositionValidById(id, (int32_t)data)) return;
+        if (!dxl_knee_position_is_ready()) {
+            if (!RobotPower_PrivateGoalAllowed(id, (int32_t)data)) return;
+        }
+    }
+    // 정상 전원 절차에서는 시작 허가 없이 관절 토크를 켜지 않음
+    if (addr == DXL_2_Torque_Enable && data != 0U
+            && !RobotPower_MotionAllowed()) return;
+    if (addr == DXL_2_Operating_Mode || addr == DXL_2_Drive_Mode
+            || addr == DXL_2_Homing_Offset) RobotPower_InvalidateReference();
+    if (addr == DXL_2_Operating_Mode
+            && WokiJoint_IsKneeIndex(WokiJoint_IndexFromId(id))) {
+        dxl_knee_position_status = DXL_KNEE_POSITION_LOCKED;
+    }
 	uint16_t idx = 0;
 	dxl_tx_buffer[idx++] = 0xFF;
 	dxl_tx_buffer[idx++] = 0xFF;
@@ -477,6 +584,45 @@ void dxl_write_2_0(uint8_t id, uint16_t addr, uint8_t data_len, uint32_t data) {
 
 	// 다리 모터는 UART6 사용
 	uart_transmit_packet(&huart6, dxl_tx_buffer, idx);
+}
+
+// 설정 답장이 다음 Read 응답과 섞이지 않도록 Broadcast Sync Write로 한 개 모터만 설정
+// 전송 완료만 반환하므로 실제 설정 성공 여부는 반드시 별도 Read로 확인
+HAL_StatusTypeDef dxl_sync_write_config_2_0(uint8_t id, uint16_t addr,
+        uint8_t data_len, uint32_t data)
+{
+    uint8_t packet[24];
+    uint8_t payload[10];
+    uint16_t idx = 7U;
+    const uint8_t gain_or_pwm = addr == DXL_2_Position_D_Gain
+            || addr == DXL_2_Position_I_Gain || addr == DXL_2_Position_P_Gain
+            || addr == DXL_2_Goal_PWM;
+    const uint8_t profile = addr == DXL_2_Profile_Acceleration
+            || addr == DXL_2_Profile_Velocity;
+    // 이 경로로 기존 위치·토크·운전 모드 안전 검사를 우회하지 못하도록 주소·폭 제한
+    if (WokiJoint_IndexFromId(id) >= DXL_LEG_MOTOR_COUNT
+            || !((gain_or_pwm && data_len == 2U && data <= 0xFFFFU)
+                    || (profile && data_len == 4U))) return HAL_ERROR;
+
+    packet[0] = 0xFFU; packet[1] = 0xFFU; packet[2] = 0xFDU;
+    packet[3] = 0U; packet[4] = 0xFEU;
+    payload[0] = DXL_INST_SYNC_WRITE;
+    payload[1] = (uint8_t)addr; payload[2] = (uint8_t)(addr >> 8U);
+    payload[3] = data_len; payload[4] = 0U; payload[5] = id;
+    for (uint8_t b = 0U; b < data_len; ++b)
+        payload[6U + b] = (uint8_t)(data >> (8U * b));
+    // Profile 저장값에 헤더 패턴이 있어도 데이터로 전달되도록 Byte Stuffing 적용
+    for (uint8_t b = 0U; b < 6U + data_len; ++b) {
+        packet[idx++] = payload[b];
+        if (idx >= 10U && packet[idx - 3U] == 0xFFU
+                && packet[idx - 2U] == 0xFFU && packet[idx - 1U] == 0xFDU)
+            packet[idx++] = 0xFDU;
+    }
+    const uint16_t length = idx - 7U + 2U;
+    packet[5] = (uint8_t)length; packet[6] = (uint8_t)(length >> 8U);
+    const uint16_t crc = update_crc(0U, packet, idx);
+    packet[idx++] = (uint8_t)crc; packet[idx++] = (uint8_t)(crc >> 8U);
+    return uart_transmit_packet(&huart6, packet, idx);
 }
 
 // Protocol 2.0 개별 Read (다리용, UART6)
@@ -678,6 +824,45 @@ uint8_t dxl_read_2_0(uint8_t id, uint16_t addr, uint16_t data_len,
 	return 1;
 }
 
+// Abort가 오류·DMA 상태를 바꾸기 전에 읽기 전용 레지스터와 경과 시간만 보존
+static void DXL_Sync_Read_Diag_Capture(uint8_t end_reason,
+		uint16_t received_length, uint32_t started) {
+	dxl_last_sync_diagnostics.end_reason = end_reason;
+	dxl_last_sync_diagnostics.received_length = received_length;
+	dxl_last_sync_diagnostics.elapsed_ms = HAL_GetTick() - started;
+	if (huart6.Instance != NULL) {
+		dxl_last_sync_diagnostics.uart_available = 1U;
+		dxl_last_sync_diagnostics.uart_error = huart6.ErrorCode;
+		dxl_last_sync_diagnostics.uart_isr = huart6.Instance->ISR;
+		dxl_last_sync_diagnostics.uart_cr3 = huart6.Instance->CR3;
+		dxl_last_sync_diagnostics.uart_rx_state = huart6.RxState;
+	}
+	if (huart6.hdmarx != NULL) {
+		dxl_last_sync_diagnostics.dma_state = huart6.hdmarx->State;
+		dxl_last_sync_diagnostics.dma_error = huart6.hdmarx->ErrorCode;
+		if (huart6.hdmarx->Instance != NULL) {
+			dxl_last_sync_diagnostics.dma_available = 1U;
+			dxl_last_sync_diagnostics.dma_ndtr = __HAL_DMA_GET_COUNTER(huart6.hdmarx);
+		}
+	}
+}
+
+// 최종 파싱 결과 기록, 실패한 조회에서만 실제 수신 범위의 원본 바이트 복사
+static void DXL_Sync_Read_Diag_Finish(const DXL_Leg_State_t *state, uint16_t parse_index) {
+	dxl_last_sync_diagnostics.sequence = state->sequence;
+	dxl_last_sync_diagnostics.timestamp_ms = state->timestamp_ms;
+	dxl_last_sync_diagnostics.valid_mask = state->valid_mask;
+	dxl_last_sync_diagnostics.received_count = state->received_count;
+	dxl_last_sync_diagnostics.parse_index = parse_index;
+	if (state->valid_mask != 0x0FFFU
+			|| state->received_count != DXL_LEG_MOTOR_COUNT) {
+		const uint16_t length = dxl_last_sync_diagnostics.received_length < DXL_SYNC_DIAG_RX_CAPACITY
+				? dxl_last_sync_diagnostics.received_length : DXL_SYNC_DIAG_RX_CAPACITY;
+		memcpy(dxl_last_sync_diagnostics.rx_bytes, dxl_sync_read_rx_buffer, length);
+		dxl_last_sync_diagnostics.copied_length = length;
+	}
+}
+
 // 12개 다리 모터 Current, Velocity, Position Sync Read
 static uint16_t DXL_Sync_Read_Leg_State_Uncached(DXL_Leg_State_t *state) {
 	uint8_t tx_packet[32];
@@ -686,6 +871,7 @@ static uint16_t DXL_Sync_Read_Leg_State_Uncached(DXL_Leg_State_t *state) {
 	uint16_t crc;
 	uint16_t received_length = 0U;
 	uint16_t previous_received_length = 0U;
+	uint16_t parse_index = 0U;
 	uint32_t start_tick;
 	uint32_t primask;
 	HAL_StatusTypeDef dma_status;
@@ -697,9 +883,16 @@ static uint16_t DXL_Sync_Read_Leg_State_Uncached(DXL_Leg_State_t *state) {
 
 	DXL_Sync_Read_Reset_State(state);
 	state->sequence = ++dxl_leg_state_sequence;
+	const uint32_t diagnostic_started = HAL_GetTick();
+	memset(&dxl_last_sync_diagnostics, 0, sizeof(dxl_last_sync_diagnostics));
+	// 0xFF는 미실행, HAL_OK와 구분. 진단 초기화는 제어 상태를 변경하지 않음
+	dxl_last_sync_diagnostics.dma_start_status = 0xFFU;
+	dxl_last_sync_diagnostics.tx_status = 0xFFU;
 
 	if (huart6.hdmarx == NULL) {
 		state->timestamp_ms = HAL_GetTick();
+		DXL_Sync_Read_Diag_Capture(DXL_SYNC_DIAG_NO_DMA, 0U, diagnostic_started);
+		DXL_Sync_Read_Diag_Finish(state, 0U);
 		return 0U;
 	}
 
@@ -729,7 +922,7 @@ static uint16_t DXL_Sync_Read_Leg_State_Uncached(DXL_Leg_State_t *state) {
 	tx_packet[tx_index++] =
 			(uint8_t) ((DXL_SYNC_STATE_DATA_LENGTH >> 8) & 0xFFU);
 
-	// 12개 다리 모터 ID 추가
+	// 정상 빌드는 기존 12개, 읽기 시험에서는 단계별 요청 ID만 선택
 	for (uint8_t i = 0U; i < DXL_LEG_MOTOR_COUNT; i++) {
 		tx_packet[tx_index++] = dxl_leg_motor_ids[i];
 	}
@@ -750,9 +943,12 @@ static uint16_t DXL_Sync_Read_Leg_State_Uncached(DXL_Leg_State_t *state) {
 	// 첫 번째 모터 응답을 놓치지 않도록 송신 전에 RX DMA 시작
 	dma_status = HAL_UART_Receive_DMA(&huart6,
 			dxl_sync_read_rx_buffer, DXL_SYNC_READ_RX_BUFFER_SIZE);
+	dxl_last_sync_diagnostics.dma_start_status = (uint8_t)dma_status;
 
 	if (dma_status != HAL_OK) {
 		state->timestamp_ms = HAL_GetTick();
+		DXL_Sync_Read_Diag_Capture(DXL_SYNC_DIAG_DMA_START_FAILED, 0U, diagnostic_started);
+		DXL_Sync_Read_Diag_Finish(state, 0U);
 		return 0U;
 	}
 
@@ -767,10 +963,15 @@ static uint16_t DXL_Sync_Read_Leg_State_Uncached(DXL_Leg_State_t *state) {
 	__disable_irq();
 	tx_status = uart_transmit_packet(&huart6, tx_packet, tx_index);
 	__set_PRIMASK(primask);
+	dxl_last_sync_diagnostics.tx_status = (uint8_t)tx_status;
 
 	if (tx_status != HAL_OK) {
+		received_length = (uint16_t)(DXL_SYNC_READ_RX_BUFFER_SIZE
+				- __HAL_DMA_GET_COUNTER(huart6.hdmarx));
+		DXL_Sync_Read_Diag_Capture(DXL_SYNC_DIAG_TX_FAILED, received_length, diagnostic_started);
 		(void) HAL_UART_AbortReceive(&huart6);
 		state->timestamp_ms = HAL_GetTick();
+		DXL_Sync_Read_Diag_Finish(state, 0U);
 		return 0U;
 	}
 
@@ -786,7 +987,7 @@ static uint16_t DXL_Sync_Read_Leg_State_Uncached(DXL_Leg_State_t *state) {
 
 			// 현재까지 완전히 수신된 Status Packet 검사
 			__DMB();
-			DXL_Sync_Read_Parse_Stream(received_length, state);
+			DXL_Sync_Read_Parse_Stream(received_length, state, &parse_index);
 
 			if (state->received_count >= DXL_LEG_MOTOR_COUNT) {
 				break;
@@ -802,12 +1003,14 @@ static uint16_t DXL_Sync_Read_Leg_State_Uncached(DXL_Leg_State_t *state) {
 	received_length = (uint16_t) (DXL_SYNC_READ_RX_BUFFER_SIZE
 			- __HAL_DMA_GET_COUNTER(huart6.hdmarx));
 
+	DXL_Sync_Read_Diag_Capture(DXL_SYNC_DIAG_RECEIVE_END, received_length, diagnostic_started);
 	(void) HAL_UART_AbortReceive(&huart6);
 	__DMB();
 
-	DXL_Sync_Read_Parse_Stream(received_length, state);
+	DXL_Sync_Read_Parse_Stream(received_length, state, &parse_index);
 
 	state->timestamp_ms = HAL_GetTick();
+	DXL_Sync_Read_Diag_Finish(state, parse_index);
 
 	return state->valid_mask;
 }
@@ -825,6 +1028,11 @@ uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state) {
 	dxl_recent_leg_state = *state;
 	dxl_recent_leg_state_available = 1U;
 	return valid_mask;
+}
+
+// 모터 재조회 없이 마지막 RAM 진단만 복사
+void dxl_get_last_sync_read_diagnostics(DXL_Sync_Read_Diagnostics_t *diagnostics) {
+	if (diagnostics != NULL) *diagnostics = dxl_last_sync_diagnostics;
 }
 
 // 메인 루프에서 최근 조회 결과 재사용, 유효 시간 0이면 새로 조회
@@ -1009,6 +1217,14 @@ void dxl_sync_write_1byte(uint8_t *ids, uint8_t *values, uint8_t count,
 	if (ids == NULL || values == NULL || count == 0) {
 		return;
 	}
+    if (addr == DXL_2_Goal_Position) return; // 목표 위치는 4바이트 확인 경로만 사용
+    if (addr == DXL_2_Torque_Enable && !RobotPower_MotionAllowed()) {
+        for (uint8_t n = 0U; n < count; ++n) if (values[n] != 0U) return;
+    }
+    if (addr == DXL_2_Operating_Mode || addr == DXL_2_Drive_Mode
+            || addr == DXL_2_Homing_Offset) {
+        RobotPower_InvalidateReference();
+    }
 
 	// 패킷 길이 계산
 	length = 7 + (count * 2);
@@ -1079,6 +1295,19 @@ static uint8_t DXL_Sync_Write_4byte_Checked(const uint8_t *ids,
 		return 0U;
 	}
 
+    if (addr == DXL_2_Goal_Position) {
+        for (i = 0U; i < count; ++i) {
+            if (!dxl_knee_position_is_ready()
+                    && !RobotPower_PrivateGoalAllowed(ids[i], (int32_t)values[i])) return 0U;
+            if (!WokiJoint_PositionValidById(ids[i], (int32_t)values[i])) return 0U;
+        }
+    }
+    if (addr == DXL_2_Torque_Enable && !RobotPower_MotionAllowed()) {
+        for (i = 0U; i < count; ++i) if ((values[i] & 0xFFU) != 0U) return 0U;
+    }
+    if (addr == DXL_2_Homing_Offset || addr == DXL_2_Operating_Mode
+            || addr == DXL_2_Drive_Mode) RobotPower_InvalidateReference();
+
 	// 패킷 헤더
 	tx_packet[idx++] = 0xFF;
 	tx_packet[idx++] = 0xFF;
@@ -1129,16 +1358,214 @@ void dxl_sync_write_4byte(uint8_t *ids, uint32_t *values, uint8_t count,
 }
 
 uint8_t dxl_sync_write_goal_positions_checked(const uint8_t *ids,
-        const uint32_t *values, uint8_t count)
+        const int32_t *values, uint8_t count)
 {
     uint8_t i, j;
+    uint32_t wire_values[DXL_LEG_MOTOR_COUNT];
     if (ids == NULL || values == NULL || count == 0U || count > DXL_LEG_MOTOR_COUNT)
         return 0U;
     for (i = 0U; i < count; ++i) {
-        if (ids[i] == 0U || ids[i] >= 0xFDU || values[i] > 4095U) return 0U;
+        if (!WokiJoint_PositionValidById(ids[i], values[i])) return 0U;
         for (j = 0U; j < i; ++j) if (ids[i] == ids[j]) return 0U;
+        // 음수 위치는 4바이트 2의 보수로 송신, 위치의 나머지 연산 없음
+        wire_values[i] = (uint32_t)values[i];
     }
-    // 단일 회전 목표 범위로 바이트 삽입 불필요
+    // 현재 소프트웨어 허용 범위에서는 데이터 안에 FF FF FD가 발생하지 않음
     // 반환값은 송신 결과, 모터 응답·동작 확인과 별도
-    return DXL_Sync_Write_4byte_Checked(ids, values, count, DXL_2_Goal_Position);
+    return DXL_Sync_Write_4byte_Checked(ids, wire_values, count, DXL_2_Goal_Position);
+}
+
+// 모드 변경으로 초기화될 수 있는 RAM 값만 기존 값 그대로 복원
+// PID 튜닝·프로파일 재설정이 아니라 변경 전 값 보존
+typedef struct {
+    uint16_t address;
+    uint8_t size;
+} DXL_Knee_Preserved_Register_t;
+static const DXL_Knee_Preserved_Register_t dxl_knee_preserved_registers[] = {
+    { DXL_2_Velocity_I_Gain, 2U }, { DXL_2_Velocity_P_Gain, 2U },
+    { DXL_2_Position_D_Gain, 2U }, { DXL_2_Position_I_Gain, 2U },
+    { DXL_2_Position_P_Gain, 2U }, { DXL_2_Feedforward_2nd_Gain, 2U },
+    { DXL_2_Feedforward_1st_Gain, 2U }, { DXL_2_Goal_PWM, 2U },
+    { DXL_2_Goal_Current, 2U }, { DXL_2_Profile_Acceleration, 4U },
+    { DXL_2_Profile_Velocity, 4U }
+};
+#define DXL_KNEE_PRESERVED_REGISTER_COUNT \
+    (sizeof(dxl_knee_preserved_registers) / sizeof(dxl_knee_preserved_registers[0]))
+
+// 설정 과정에서만 제한된 재조회, 기존 주기 통신 경로와 별도
+static uint8_t DXL_Knee_Config_Read(uint8_t id, uint16_t address,
+        uint8_t size, uint32_t *value, DXL_Knee_Mode_Config_Result_t *result)
+{
+    uint8_t data[4];
+    for (uint8_t attempt = 0U; attempt < 3U; ++attempt) {
+        if (user_stop_flag) { result->stopped = 1U; return 0U; }
+        if (dxl_read_2_0(id, address, size, data,
+                &result->device_error, &result->read_fail_stage)
+                && result->device_error == 0U) {
+            *value = 0U;
+            for (uint8_t i = 0U; i < size; ++i)
+                *value |= (uint32_t)data[i] << (8U * i);
+            result->read_fail_stage = 0U;
+            return 1U;
+        }
+        HAL_Delay(2U);
+    }
+    return 0U;
+}
+
+// 영점 미정 상태에서도 설정 가능, 목표 위치 송신·토크 재인가 없음
+uint8_t dxl_configure_knee_extended_mode(DXL_Knee_Mode_Config_Result_t *result)
+{
+    uint8_t ids[4];
+    uint32_t old_mode[4], saved[4][DXL_KNEE_PRESERVED_REGISTER_COUNT];
+    uint32_t value;
+    if (result == NULL) return 0U;
+    memset(result, 0, sizeof(*result));
+    dxl_knee_position_status = DXL_KNEE_POSITION_LOCKED;
+    if (user_stop_flag) { result->stopped = 1U; return 0U; }
+
+    // 네 모터 모두 조회 성공 후 변경 시작, ROLL/PITCH·AX 설정 제외
+    result->stage = DXL_KNEE_CONFIG_SNAPSHOT;
+    for (uint8_t leg = 0U; leg < 4U; ++leg) {
+        ids[leg] = legs[leg + 1U].knee;
+        result->failed_id = ids[leg];
+        if (WokiJoint_IndexFromId(ids[leg]) != (uint32_t)leg * 3U + 2U)
+            return 0U;
+        if (!DXL_Knee_Config_Read(ids[leg], DXL_2_Operating_Mode,
+                1U, &old_mode[leg], result)) return 0U;
+        for (uint32_t reg = 0U; reg < DXL_KNEE_PRESERVED_REGISTER_COUNT; ++reg) {
+            const DXL_Knee_Preserved_Register_t *item = &dxl_knee_preserved_registers[reg];
+            if (!DXL_Knee_Config_Read(ids[leg], item->address, item->size,
+                    &saved[leg][reg], result)) return 0U;
+        }
+    }
+
+    // 로봇을 외부 지지한 뒤 사용, 네 KNEE 토크 OFF를 먼저 확인
+    result->stage = DXL_KNEE_CONFIG_TORQUE_OFF;
+    for (uint8_t leg = 0U; leg < 4U; ++leg)
+        dxl_write_2_0(ids[leg], DXL_2_Torque_Enable, 1U, 0U);
+    HAL_Delay(20U);
+    for (uint8_t leg = 0U; leg < 4U; ++leg) {
+        result->failed_id = ids[leg];
+        if (!DXL_Knee_Config_Read(ids[leg], DXL_2_Torque_Enable,
+                1U, &value, result) || value != 0U) return 0U;
+        result->torque_off_mask |= (uint8_t)(1U << leg);
+    }
+
+    for (uint8_t leg = 0U; leg < 4U; ++leg) {
+        result->failed_id = ids[leg];
+        result->stage = DXL_KNEE_CONFIG_MODE;
+        if (user_stop_flag) { result->stopped = 1U; return 0U; }
+        // 이미 모드 4이면 EEPROM 재기록 제외
+        if (old_mode[leg] != WOKI_KNEE_EXTENDED_MODE) {
+            dxl_write_2_0(ids[leg], DXL_2_Operating_Mode, 1U, WOKI_KNEE_EXTENDED_MODE);
+            HAL_Delay(20U);
+        }
+        if (!DXL_Knee_Config_Read(ids[leg], DXL_2_Operating_Mode,
+                1U, &value, result) || value != WOKI_KNEE_EXTENDED_MODE) return 0U;
+        result->mode_mask |= (uint8_t)(1U << leg);
+
+        // 모드 변경으로 초기화된 값만 복원하고 항목별 readback 확인
+        result->stage = DXL_KNEE_CONFIG_RESTORE;
+        for (uint32_t reg = 0U; reg < DXL_KNEE_PRESERVED_REGISTER_COUNT; ++reg) {
+            const DXL_Knee_Preserved_Register_t *item = &dxl_knee_preserved_registers[reg];
+            if (user_stop_flag) { result->stopped = 1U; return 0U; }
+            if (old_mode[leg] != WOKI_KNEE_EXTENDED_MODE) {
+                dxl_write_2_0(ids[leg], item->address, item->size, saved[leg][reg]);
+                HAL_Delay(2U);
+            }
+            if (!DXL_Knee_Config_Read(ids[leg], item->address, item->size,
+                    &value, result) || value != saved[leg][reg]) return 0U;
+        }
+        result->restored_mask |= (uint8_t)(1U << leg);
+    }
+
+    result->stage = DXL_KNEE_CONFIG_VERIFY;
+    for (uint8_t leg = 0U; leg < 4U; ++leg) {
+        result->failed_id = ids[leg];
+        if (!DXL_Knee_Config_Read(ids[leg], DXL_2_Torque_Enable,
+                1U, &value, result) || value != 0U) return 0U;
+    }
+    if (user_stop_flag) { result->stopped = 1U; return 0U; }
+    result->failed_id = 0U;
+    result->stage = DXL_KNEE_CONFIG_COMPLETE;
+    // 영점 확인 전에는 준비 완료로 바꾸지 않고 위치 출력 잠금 유지
+    return 1U;
+}
+
+uint8_t dxl_knee_position_is_ready(void)
+{
+    return WOKI_KNEE_POSITION_OUTPUT_ENABLED
+            && dxl_knee_position_status == DXL_KNEE_POSITION_READY
+            && RobotPower_MotionAllowed();
+}
+
+// 누적 위치 기준을 확인한 Wheel 자세에서만 준비, 자동 영점 탐색·회전수 복구 제외
+uint8_t dxl_prepare_knee_extended_position(void)
+{
+    uint8_t ids[4];
+    uint8_t data[4], device_error, fail_stage;
+    uint32_t leg;
+    dxl_knee_position_status = DXL_KNEE_POSITION_LOCKED;
+    if (WOKI_KNEE_REFERENCE_VERIFIED != 1U) return 0U;
+    if (user_stop_flag) {
+        dxl_knee_position_status = DXL_KNEE_POSITION_STOPPED;
+        return 0U;
+    }
+    // 모터의 1회전 엔코더만으로 기어 출력축 자세를 알아낼 수는 없음
+    // 이 확인은 실측 기준·전원 인가 전 Wheel 자세 확인을 대신하지 않음
+    for (leg = 0U; leg < 4U; ++leg) {
+        const float reference = WokiJoint_KneeReference(leg);
+        ids[leg] = legs[leg + 1U].knee;
+        // 모드 4의 Wheel 기준은 4096도 허용, 한 바퀴 범위 대신 관절 기구 범위 확인
+        if (!isfinite(reference)
+                || reference < (float)WokiJoint_MinRaw(leg * 3U + 2U)
+                || reference > (float)WokiJoint_MaxRaw(leg * 3U + 2U)) {
+            dxl_knee_position_status = DXL_KNEE_POSITION_REFERENCE_ERROR;
+            return 0U;
+        }
+    }
+    // 부팅 준비에서는 운전 모드 읽기만 수행, EEPROM 자동 변경·토크 해제 없음
+    // 실제 모드 4 설정은 외부 지지 후 별도 설정 명령에서 수행
+    for (leg = 0U; leg < 4U; ++leg) {
+        if (user_stop_flag) {
+            dxl_knee_position_status = DXL_KNEE_POSITION_STOPPED;
+            return 0U;
+        }
+        if (!dxl_read_2_0(ids[leg], DXL_2_Operating_Mode, 1U,
+                data, &device_error, &fail_stage) || device_error != 0U
+                || data[0] != WOKI_KNEE_EXTENDED_MODE) {
+            dxl_knee_position_status = DXL_KNEE_POSITION_MODE_ERROR;
+            return 0U;
+        }
+        // 기존 코드는 속도 기반 프로파일 전제, 시간 기반 값에 2.5배 적용 금지
+        if (!dxl_read_2_0(ids[leg], DXL_2_Drive_Mode, 1U,
+                data, &device_error, &fail_stage) || device_error != 0U) {
+            dxl_knee_position_status = DXL_KNEE_POSITION_COMM_ERROR;
+            return 0U;
+        }
+        if ((data[0] & 0x04U) != 0U) {
+            dxl_knee_position_status = DXL_KNEE_POSITION_PROFILE_MODE_ERROR;
+            return 0U;
+        }
+        if (!dxl_read_2_0(ids[leg], DXL_2_Present_Position, 4U,
+                data, &device_error, &fail_stage) || device_error != 0U) {
+            dxl_knee_position_status = DXL_KNEE_POSITION_COMM_ERROR;
+            return 0U;
+        }
+        const int32_t actual = (int32_t)((uint32_t)data[0]
+                | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16)
+                | ((uint32_t)data[3] << 24));
+        if (fabsf((float)actual - WokiJoint_KneeReference(leg))
+                > (float)WOKI_KNEE_STARTUP_TOLERANCE_RAW) {
+            dxl_knee_position_status = DXL_KNEE_POSITION_REFERENCE_ERROR;
+            return 0U;
+        }
+    }
+    if (user_stop_flag) {
+        dxl_knee_position_status = DXL_KNEE_POSITION_STOPPED;
+        return 0U;
+    }
+    dxl_knee_position_status = DXL_KNEE_POSITION_READY;
+    return 1U;
 }

@@ -1,23 +1,24 @@
 #include "woki_ramp_motion.h"
+#include "woki_joint_config.h"
 #include <math.h>
 #include <stddef.h>
 #include <string.h>
 
 #define RAMP_COUNTS_PER_DEG (4096.0f / 360.0f)
-#define RAMP_KNEE_COUNTS_PER_DEG (2.0f * RAMP_COUNTS_PER_DEG)
+#define RAMP_KNEE_COUNTS_PER_DEG WOKI_KNEE_COUNTS_PER_DEG
 
 // 기존 3.31초 전환 기준 속도
 #define RAMP_COMMAND_RATE_RAW_S 175.0f
-// 목표 도착 4도, 지속 오류 5도
-#define RAMP_SETTLE_TOLERANCE_DEG 4.0f
-#define RAMP_TRACKING_TOLERANCE_DEG 5.0f
+// 목표 도착 및 지속 오류 허용 범위
+#define RAMP_SETTLE_TOLERANCE_DEG 6.0f
+#define RAMP_TRACKING_TOLERANCE_DEG 10.0f
 // 정착 및 오류 판정 시간
-#define RAMP_SETTLE_MS (2U * WOKI_RAMP_SAMPLE_MS)
+#define RAMP_SETTLE_MS WOKI_RAMP_SAMPLE_MS
 #define RAMP_TRACKING_TIMEOUT_MS (20U * WOKI_RAMP_SAMPLE_MS)
-#define RAMP_MOTION_TIMEOUT_MS 15000U
-#define RAMP_MAX_UPDATE_GAP_MS (5U * WOKI_RAMP_SAMPLE_MS)
-#define RAMP_INPUT_MAX_AGE_MS (5U * WOKI_RAMP_SAMPLE_MS)
-#define RAMP_SETTLED_VELOCITY_RAW 3U
+#define RAMP_MOTION_TIMEOUT_MS 30000U
+#define RAMP_MAX_UPDATE_GAP_MS (10U * WOKI_RAMP_SAMPLE_MS)
+#define RAMP_INPUT_MAX_AGE_MS (10U * WOKI_RAMP_SAMPLE_MS)
+#define RAMP_SETTLED_VELOCITY_RAW 10U
 #define RAMP_LEVEL_TOLERANCE_DEG 5.0f
 #define RAMP_MAX_LATERAL_DEG 16.0f
 #define RAMP_MAX_LONGITUDINAL_DEG 10.5f
@@ -44,13 +45,14 @@ static const uint32_t ramp_active_max_raw[12] = {
     2334U, 2330U, 3000U, 2302U, 1972U, 1096U
 };
 
-static uint8_t ramp_command_in_range(const uint32_t raw[12], uint8_t active)
+static uint8_t ramp_command_in_range(const int32_t raw[12], uint8_t active)
 {
     const uint32_t *minimum = active ? ramp_active_min_raw : ramp_path_min_raw;
     const uint32_t *maximum = active ? ramp_active_max_raw : ramp_path_max_raw;
     uint32_t i;
     for (i = 0U; i < 12U; ++i)
-        if (raw[i] < minimum[i] || raw[i] > maximum[i]) return 0U;
+        if (raw[i] < WokiJoint_LegacyPosition(i, (float)minimum[i])
+                || raw[i] > WokiJoint_LegacyPosition(i, (float)maximum[i])) return 0U;
     return 1U;
 }
 
@@ -62,30 +64,34 @@ void WokiRampMotion_DefaultConfig(WokiRampMotionConfig *c)
     uint32_t leg, i;
     if (c == NULL) return;
     memset(c, 0, sizeof(*c));
-    // 확인한 경사로 설정 적용
-    c->mapping_verified = 1U;
-    c->limits_and_motion_verified = 1U;
-    c->transition_path_verified = 1U;
-    c->motor_mode_profile_verified = 1U;
+    // 1:5 기어의 실물 확인 전에는 기존 1:2 검증을 재사용하지 않음
+    c->mapping_verified = WOKI_KNEE_REFERENCE_VERIFIED;
+    c->limits_and_motion_verified = WOKI_KNEE_REFERENCE_VERIFIED;
+    c->transition_path_verified = WOKI_KNEE_REFERENCE_VERIFIED;
+    c->motor_mode_profile_verified = WOKI_KNEE_REFERENCE_VERIFIED;
     c->emergency_stop_path_verified = 1U;
     // 시뮬 Knee 13도 기준: 왼쪽 3000, 오른쪽 1096
     // LEG 내부각·설계 각도와 별도 좌표 기준
     for (leg = 0; leg < 4U; ++leg) {
         c->knee_ref_usd_deg[leg] = 13.0f;
-        c->knee_ref_raw[leg] = (leg % 2U == 0U) ? 3000.0f : 1096.0f;
+        c->knee_ref_raw[leg] = WokiJoint_FromLegacyRaw(leg * 3U + 2U,
+                (leg % 2U == 0U) ? 3000.0f : 1096.0f);
     }
     // 관절 범위와 오차 기준 적용
     for (i = 0U; i < 12U; ++i) {
         const float counts_per_deg = (i % 3U == 2U)
                 ? RAMP_KNEE_COUNTS_PER_DEG : RAMP_COUNTS_PER_DEG;
-        c->min_raw[i] = ramp_path_min_raw[i];
-        c->max_raw[i] = ramp_path_max_raw[i];
-        c->command_rate_raw_s[i] = RAMP_COMMAND_RATE_RAW_S;
+        c->min_raw[i] = WokiJoint_LegacyPosition(i, (float)ramp_path_min_raw[i]);
+        c->max_raw[i] = WokiJoint_LegacyPosition(i, (float)ramp_path_max_raw[i]);
+        // KNEE 엔코더 속도만 환산, 기존 관절 변화 속도·시간 정책 유지
+        const float scale = WokiJoint_IsKneeIndex(i) ? WOKI_KNEE_LEGACY_TO_CURRENT : 1.0f;
+        c->command_rate_raw_s[i] = RAMP_COMMAND_RATE_RAW_S * scale;
         c->settle_tolerance_raw[i] = (uint32_t)
                 (RAMP_SETTLE_TOLERANCE_DEG * counts_per_deg + 0.5f);
         c->tracking_tolerance_raw[i] = (uint32_t)
                 (RAMP_TRACKING_TOLERANCE_DEG * counts_per_deg + 0.5f);
-        c->settled_velocity_raw[i] = RAMP_SETTLED_VELOCITY_RAW;
+        c->settled_velocity_raw[i] = (uint32_t)WokiJoint_RoundRaw(
+                (float)RAMP_SETTLED_VELOCITY_RAW * scale);
     }
     c->settle_ms = RAMP_SETTLE_MS;
     c->tracking_timeout_ms = RAMP_TRACKING_TIMEOUT_MS;
@@ -120,17 +126,20 @@ uint8_t WokiRampMotion_ConfigValid(const WokiRampMotionConfig *c)
             || c->entry_exit_level_deg > c->max_longitudinal_deg) return 0U;
     for (i = 0; i < 4U; ++i) {
         if (!isfinite(c->knee_ref_usd_deg[i]) || !isfinite(c->knee_ref_raw[i])
-                || c->knee_ref_raw[i] < 0.0f || c->knee_ref_raw[i] > 4095.0f)
+                || c->knee_ref_raw[i] < (float)WokiJoint_MinRaw(i * 3U + 2U)
+                || c->knee_ref_raw[i] > (float)WokiJoint_MaxRaw(i * 3U + 2U))
             return 0U;
     }
     for (i = 0; i < 12U; ++i) {
-        if (c->max_raw[i] > 4095U || c->min_raw[i] >= c->max_raw[i]
+        if (!WokiJoint_PositionValid(i, c->min_raw[i])
+                || !WokiJoint_PositionValid(i, c->max_raw[i])
+                || c->min_raw[i] >= c->max_raw[i]
                 || !positive(c->command_rate_raw_s[i])
-                || c->command_rate_raw_s[i] > 4095000.0f
+                || c->command_rate_raw_s[i] > (float)(WokiJoint_MaxRaw(i) - WokiJoint_MinRaw(i)) * 1000.0f
                 || c->settle_tolerance_raw[i] == 0U
                 || c->settle_tolerance_raw[i] >= c->tracking_tolerance_raw[i]
                 || c->tracking_tolerance_raw[i] == 0U
-                || c->tracking_tolerance_raw[i] >= c->max_raw[i] - c->min_raw[i]
+                || c->tracking_tolerance_raw[i] >= (uint32_t)(c->max_raw[i] - c->min_raw[i])
                 || c->settled_velocity_raw[i] == 0U
                 || c->settled_velocity_raw[i] >= 0x80000000U) return 0U;
     }
@@ -138,7 +147,7 @@ uint8_t WokiRampMotion_ConfigValid(const WokiRampMotionConfig *c)
 }
 
 uint8_t WokiRampMotion_Encode(const WokiRampMotionConfig *c,
-        const WokiSlopeOutput *target, uint32_t raw[12])
+        const WokiSlopeOutput *target, int32_t raw[12])
 {
     float values[12];
     uint32_t leg, i;
@@ -157,9 +166,10 @@ uint8_t WokiRampMotion_Encode(const WokiRampMotionConfig *c,
     }
     // 엔코더 표현 범위 초과 시 명령 거부
     for (i = 0; i < 12U; ++i)
-        if (!isfinite(values[i]) || values[i] < 0.0f || values[i] > 4095.0f)
+        if (!isfinite(values[i]) || values[i] < (float)WokiJoint_MinRaw(i)
+                || values[i] > (float)WokiJoint_MaxRaw(i))
             return 0U;
-    for (i = 0; i < 12U; ++i) raw[i] = (uint32_t)(values[i] + 0.5f);
+    for (i = 0; i < 12U; ++i) raw[i] = WokiJoint_RoundRaw(values[i]);
     return 1U;
 }
 
@@ -177,7 +187,7 @@ void WokiRampMotion_Fail(WokiRampMotion *m, WokiRampMotionFault fault)
     // 이전 목표 유지, 토크 해제·현재각 재지정 제외
 }
 
-static uint8_t in_range(const WokiRampMotion *m, const uint32_t raw[12])
+static uint8_t in_range(const WokiRampMotion *m, const int32_t raw[12])
 {
     uint32_t i;
     if (!ramp_command_in_range(raw, 0U)) return 0U;
@@ -203,18 +213,18 @@ static WokiRampMotionFault frame_fault(const WokiRampMotion *m,
     return WOKI_RAMP_FAULT_NONE;
 }
 
-static uint8_t level(const WokiRampMotion *m, const WokiRampMotionFrame *f)
+static WokiRampMotionFault return_frame_fault(const WokiRampMotion *m,
+        const WokiRampMotionFrame *f)
 {
-    const float tolerance = m->config.entry_exit_level_deg;
-    return f->formula_valid && isfinite(f->formula.lateral_raw_deg)
-            && isfinite(f->formula.longitudinal_raw_deg)
-            && fabsf(f->body_roll_deg) <= tolerance
-            && fabsf(f->body_pitch_deg) <= tolerance
-            && fabsf(f->formula.lateral_raw_deg) <= tolerance
-            && fabsf(f->formula.longitudinal_raw_deg) <= tolerance;
+    if (f == NULL) return WOKI_RAMP_FAULT_INPUT;
+    if (f->emergency_stop) return WOKI_RAMP_FAULT_STOP;
+    if (f->motor_valid_mask != 0x0FFFU || f->motor_error_mask != 0U
+            || f->motor_age_ms > m->config.motor_max_age_ms)
+        return WOKI_RAMP_FAULT_MOTOR;
+    return WOKI_RAMP_FAULT_NONE;
 }
 
-static uint8_t start_path(WokiRampMotion *m, const uint32_t target[12],
+static uint8_t start_path(WokiRampMotion *m, const int32_t target[12],
         uint32_t now_ms, WokiRampMotionPhase phase)
 {
     uint32_t i;
@@ -246,11 +256,12 @@ static uint8_t start_path(WokiRampMotion *m, const uint32_t target[12],
 }
 
 uint8_t WokiRampMotion_Begin(WokiRampMotion *m,
-        const WokiRampMotionConfig *c, const uint32_t wheel_raw[12],
+        const WokiRampMotionConfig *c, const int32_t wheel_raw[12],
         const WokiRampMotionFrame *f)
 {
     WokiSlopeOutput neutral;
-    uint32_t target[12], i;
+    int32_t target[12];
+    uint32_t i;
     WokiRampMotionFault fault;
     if (m == NULL || c == NULL || wheel_raw == NULL || f == NULL) return 0U;
     // 동작 중·오류 상태의 자동 초기화 차단
@@ -283,57 +294,40 @@ uint8_t WokiRampMotion_Begin(WokiRampMotion *m,
 
 uint8_t WokiRampMotion_RequestReturn(WokiRampMotion *m, const WokiRampMotionFrame *f)
 {
-    WokiRampMotionFault fault;
-    uint32_t i;
-    uint8_t fault_return;
     if (m == NULL || f == NULL || !m->configured) return 0U;
     if (m->phase == WOKI_RAMP_MOTION_EXITING || m->phase == WOKI_RAMP_MOTION_RETURNED) return 1U;
-    fault_return = (m->phase == WOKI_RAMP_MOTION_FAULT) ? 1U : 0U;
     if (m->phase != WOKI_RAMP_MOTION_ACTIVE
-			&& m->phase != WOKI_RAMP_MOTION_ENTERING && fault_return == 0U)
+            && m->phase != WOKI_RAMP_MOTION_ENTERING
+            && m->phase != WOKI_RAMP_MOTION_FAULT)
 		return 0U;
-    fault = frame_fault(m, f);
-    if (fault != WOKI_RAMP_FAULT_NONE) { WokiRampMotion_Fail(m, fault); return 0U; }
-    if (!level(m, f)) {
-        // 복귀 조건 미충족 시 보정 유지, 호출부에서 바퀴 정지
-        m->fault = WOKI_RAMP_FAULT_EXIT_NOT_LEVEL;
+    if (f->emergency_stop) {
+        WokiRampMotion_Fail(m, WOKI_RAMP_FAULT_STOP);
         return 0U;
     }
-	if (fault_return != 0U) {
-		for (i = 0U; i < 12U; ++i)
-			if (fabsf((float)f->actual_raw[i] - m->command_raw[i])
-					> (float)m->config.tracking_tolerance_raw[i])
-				return 0U;
-		m->fault = WOKI_RAMP_FAULT_NONE;
-		m->return_requested = 1U;
-		m->error_timer_active = 0U;
-		m->settle_timer_active = 0U;
-		return start_path(m, m->wheel_raw, f->now_ms,
-				WOKI_RAMP_MOTION_EXITING);
-	}
-    if (!m->return_requested) {
-        m->return_requested = 1U;
-        m->drive_ready = 0U;
-        if (m->phase == WOKI_RAMP_MOTION_ACTIVE) {
-            m->settle_timer_active = 0U;
-            m->phase_start_ms = f->now_ms;
-        }
-    }
-    return 1U; // 준비자세 완료 및 정착 후 복귀 진행
+    // 현재 보정 자세에서 Wheel 자세로 바로 복귀
+    m->return_requested = 1U;
+    m->drive_ready = 0U;
+    m->error_timer_active = 0U;
+    m->settle_timer_active = 0U;
+    m->fault = WOKI_RAMP_FAULT_NONE;
+    return start_path(m, m->wheel_raw, f->now_ms,
+            WOKI_RAMP_MOTION_EXITING);
 }
 
 uint8_t WokiRampMotion_Update(WokiRampMotion *m,
-        const WokiRampMotionFrame *f, uint32_t raw[12])
+        const WokiRampMotionFrame *f, int32_t raw[12])
 {
     WokiRampMotionFault fault;
-    uint32_t i, dt, elapsed, desired[12];
-    uint8_t tracking_ok = 1U, settled_ok = 1U, quiet = 1U, path_done = 0U;
+    uint32_t i, dt, elapsed;
+    int32_t desired[12];
+    uint8_t tracking_ok = 1U, quiet = 1U, path_done = 0U;
     float candidate[12];
     if (m == NULL || f == NULL || raw == NULL || !m->configured) return 0U;
     if (m->phase != WOKI_RAMP_MOTION_ENTERING && m->phase != WOKI_RAMP_MOTION_ACTIVE
             && m->phase != WOKI_RAMP_MOTION_EXITING) return 0U;
 	if (m->phase != WOKI_RAMP_MOTION_ACTIVE) m->drive_ready = 0U;
-    fault = frame_fault(m, f);
+    fault = (m->phase == WOKI_RAMP_MOTION_EXITING)
+            ? return_frame_fault(m, f) : frame_fault(m, f);
     if (fault != WOKI_RAMP_FAULT_NONE) { WokiRampMotion_Fail(m, fault); return 0U; }
     dt = f->now_ms - m->last_ms;
     if (dt > m->config.max_update_gap_ms) {
@@ -350,13 +344,12 @@ uint8_t WokiRampMotion_Update(WokiRampMotion *m,
                 fabsf((float)f->actual_raw[i] - m->command_raw[i]);
         if (tracking_error > (float)m->config.tracking_tolerance_raw[i])
             tracking_ok = 0U;
-        if (tracking_error > (float)m->config.settle_tolerance_raw[i])
-            settled_ok = 0U;
         if (fabsf((float)f->velocity_raw[i])
                 > (float)m->config.settled_velocity_raw[i]) quiet = 0U;
     }
     // 준비자세 진입 중 추종 오차로 시작 차단 제외
-    if (!tracking_ok && m->phase != WOKI_RAMP_MOTION_ENTERING) {
+    if (!tracking_ok && m->phase != WOKI_RAMP_MOTION_ENTERING
+            && m->phase != WOKI_RAMP_MOTION_EXITING) {
         if (!m->error_timer_active) { m->error_timer_active = 1U; m->error_since_ms = f->now_ms; }
         if (m->phase == WOKI_RAMP_MOTION_ACTIVE)
             m->drive_ready = (f->now_ms - m->error_since_ms
@@ -367,21 +360,7 @@ uint8_t WokiRampMotion_Update(WokiRampMotion *m,
         m->settle_timer_active = 0U;
         return 0U;
     } else m->error_timer_active = 0U;
-    if (m->phase == WOKI_RAMP_MOTION_ACTIVE && m->return_requested) {
-        if (!level(m, f)) { WokiRampMotion_Fail(m, WOKI_RAMP_FAULT_EXIT_NOT_LEVEL); return 0U; }
-        if (f->now_ms - m->phase_start_ms >= m->config.motion_timeout_ms) {
-            WokiRampMotion_Fail(m, WOKI_RAMP_FAULT_TIMEOUT); return 0U;
-        }
-        for (i = 0; i < 12U; ++i) candidate[i] = m->command_raw[i];
-        if (settled_ok && quiet) {
-            if (!m->settle_timer_active) {
-                m->settle_timer_active = 1U;
-                m->settled_since_ms = f->now_ms;
-            }
-            if (f->now_ms - m->settled_since_ms >= m->config.settle_ms)
-                if (!start_path(m, m->wheel_raw, f->now_ms, WOKI_RAMP_MOTION_EXITING)) return 0U;
-        } else m->settle_timer_active = 0U;
-    } else if (m->phase == WOKI_RAMP_MOTION_ACTIVE) {
+    if (m->phase == WOKI_RAMP_MOTION_ACTIVE) {
         if (!f->formula_valid || !isfinite(f->formula.lateral_raw_deg)
                 || !isfinite(f->formula.longitudinal_raw_deg)) {
             WokiRampMotion_Fail(m, WOKI_RAMP_FAULT_INPUT); return 0U;
@@ -429,11 +408,11 @@ uint8_t WokiRampMotion_Update(WokiRampMotion *m,
     for (i = 0; i < 12U; ++i) {
         if (!isfinite(candidate[i]) || candidate[i] < (float)m->config.min_raw[i]
                 || candidate[i] > (float)m->config.max_raw[i]
-                || candidate[i] < (float)ramp_path_min_raw[i]
-                || candidate[i] > (float)ramp_path_max_raw[i]) {
+                || candidate[i] < (float)WokiJoint_LegacyPosition(i, (float)ramp_path_min_raw[i])
+                || candidate[i] > (float)WokiJoint_LegacyPosition(i, (float)ramp_path_max_raw[i])) {
             WokiRampMotion_Fail(m, WOKI_RAMP_FAULT_RANGE); return 0U;
         }
-        desired[i] = (uint32_t)(candidate[i] + 0.5f);
+        desired[i] = WokiJoint_RoundRaw(candidate[i]);
     }
     // 12개 목표 전체 검사 후 적용, 부분 적용·강제 제한 제외
     if (!ramp_command_in_range(desired, m->phase == WOKI_RAMP_MOTION_ACTIVE)) {

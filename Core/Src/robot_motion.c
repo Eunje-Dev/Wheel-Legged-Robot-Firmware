@@ -9,11 +9,11 @@
 #include "wheel_to_leg_trajectory_data.h"
 #include "woki_ramp_control.h"
 #include "woki_walk_demo_trajectory.h"
+#include "woki_joint_config.h"
+#include "woki_power_guard.h"
 
 //AX Wheel Mode 초기 설정 저장
 static uint8_t ax_wheel_mode_ready = 0;
-// 전원 인가 후 최초 Wheel 자세 전환 여부
-static uint8_t first_wheel_pose = 1;
 // 시작 자세 Mode_NONE 저장
 static volatile RobotMode_t robot_mode = MODE_NONE;
 
@@ -28,8 +28,6 @@ static int16_t wheel_drive_current_speed = 0;
 static int16_t wheel_drive_target_speed = 0;
 static uint32_t wheel_drive_last_update_ms = 0U;
 static uint8_t wheel_drive_accel_active = 0U;
-
-#define WHEEL_POSE_WAIT_TIME_MS 3000
 
 // Wheel·경사로 관절 프로파일
 #define WHEEL_PROFILE_ACCELERATION 5U
@@ -46,12 +44,18 @@ static uint8_t wheel_drive_accel_active = 0U;
 
 volatile RobotWalkDemoStatus_t robot_walk_demo_status;
 
-static uint32_t walk_demo_start_raw[12];
-static uint32_t walk_demo_target_raw[12];
+static int32_t walk_demo_start_raw[12];
+static int32_t walk_demo_target_raw[12];
+// 원본 1:2 목표를 누적한 뒤 환산, 변화량 반올림 누적 방지
+static int32_t walk_demo_legacy_target_raw[12];
 static uint32_t walk_demo_phase_start_ms = 0U;
 static uint32_t walk_demo_last_update_ms = 0U;
 static uint32_t walk_demo_speed_accumulator = 0U;
 static uint8_t walk_demo_target_valid = 0U;
+
+// 원본 0 변화량 구간을 같은 샘플 수로 재생
+static uint32_t walk_demo_delta_event_index = 0U;
+static uint16_t walk_demo_zero_remaining = 0U;
 
 // 수식 기반 Wheel-to-Leg 무부하 시험 제어 주기 및 1.5배 시간 설정
 #define WHEEL_TO_LEG_CONTROL_PERIOD_MS  10U
@@ -75,17 +79,17 @@ static uint8_t walk_demo_target_valid = 0U;
 
 // MX 영점 및 각도-엔코더 환산값
 #define WHEEL_TO_LEG_PITCH_ZERO_POSITION       2048.0f
-#define WHEEL_TO_LEG_LEFT_KNEE_ZERO_POSITION   2691.4569f
-#define WHEEL_TO_LEG_RIGHT_KNEE_ZERO_POSITION  1404.5431f
 #define WHEEL_TO_LEG_PITCH_POSITION_PER_DEG    (4096.0f / 360.0f)
-#define WHEEL_TO_LEG_KNEE_POSITION_PER_DEG     (2.0f * 4096.0f / 360.0f)
+#define WHEEL_TO_LEG_KNEE_POSITION_PER_DEG     WOKI_KNEE_COUNTS_PER_DEG
 
 static void Robot_Run_Leg_To_Wheel_Trajectory(void);
+static uint8_t Robot_Wheel_To_Leg_Stop_Requested(void);
 static RobotMode_t ramp_pending_mode = MODE_NONE;
 static void Robot_Finish_Ramp_Return(void);
 
 // 로봇 동작 초기화
 void Robot_Motion_Init(void) {
+	RobotPower_Init(); // 매 부팅마다 시작 허가 해제, 이전 세션 허가를 재사용하지 않음
 	WokiRampControl_Init();
 	robot_walk_demo_status.active = 0U;
 	robot_walk_demo_status.state = WALK_DEMO_IDLE;
@@ -95,14 +99,32 @@ void Robot_Motion_Init(void) {
 	walk_demo_target_valid = 0U;
 }
 
+// 주차·잠금 상태에서 이전 보행·경사로·가속 명령이 목표를 다시 덮어쓰지 않도록 정리
+// 관절 토크를 끄지 않으며, 바퀴에는 속도 0만 전송
+void Robot_Power_StopLocalMotion(void) {
+	Robot_Wheel_Stop();
+	robot_walk_demo_status.active = 0U;
+	robot_walk_demo_status.state = WALK_DEMO_STOPPED;
+	walk_demo_target_valid = 0U;
+	ramp_pending_mode = MODE_NONE;
+	// 전원 기준을 잃은 세션의 경사로 경로는 재개하지 않음. RAM만 초기화, 모터 목표는 유지
+	WokiRampControl_Init();
+	robot_mode = MODE_NONE;
+}
+
 // 경사로 입력·계산 및 자세 전환 처리
 void Robot_Ramp_Control_Task(void) {
+	if (!RobotPower_MotionAllowed()) return;
 	if (robot_mode == MODE_RAMP) {
 		WokiRampControl_Task();
         // 주행 허용 해제 시 정속 주행도 정지
         if (!WokiRampControl_IsDriveReady()
                 && (wheel_drive_current_speed != 0 || wheel_drive_target_speed != 0
                         || wheel_drive_accel_active)) Robot_Wheel_Stop();
+        if (ramp_pending_mode != MODE_NONE
+                && !WokiRampControl_IsWheelReturnComplete()) {
+            (void) WokiRampControl_RequestWheelReturn();
+        }
         Robot_Finish_Ramp_Return();
 	}
 }
@@ -136,8 +158,10 @@ static void Robot_Set_Leg_Profile(uint32_t acceleration, uint32_t velocity) {
 	uint32_t velocity_values[12];
 
 	for (uint32_t i = 0U; i < 12U; ++i) {
-		acceleration_values[i] = acceleration;
-		velocity_values[i] = velocity;
+		const float scale = WokiJoint_IsKneeIndex(i)
+				? WOKI_KNEE_LEGACY_TO_CURRENT : 1.0f;
+		acceleration_values[i] = (uint32_t)WokiJoint_RoundRaw((float)acceleration * scale);
+		velocity_values[i] = (uint32_t)WokiJoint_RoundRaw((float)velocity * scale);
 	}
 
 	dxl_sync_write_4byte(ids, acceleration_values, 12,
@@ -176,6 +200,7 @@ static void Robot_AX_Wheel_Mode_Setup(void) {
 
 // Wheel Mode 전진·후진 가속 처리
 void Robot_Wheel_Drive_Task(void) {
+	if (!RobotPower_MotionAllowed()) return;
 	uint32_t current_time;
 	int16_t wheel_data[4];
 
@@ -228,6 +253,7 @@ void Robot_Wheel_Drive_Task(void) {
 
 // Wheel Mode 전진
 void Robot_Wheel_Forward(void) {
+	if (!RobotPower_MotionAllowed()) return;
 	if (robot_mode != MODE_WHEEL
 			&& (robot_mode != MODE_RAMP || !WokiRampControl_IsDriveReady())) {
 		Robot_Wheel_Stop();
@@ -247,6 +273,7 @@ void Robot_Wheel_Forward(void) {
 
 // Wheel Mode 후진
 void Robot_Wheel_Backward(void) {
+	if (!RobotPower_MotionAllowed()) return;
 	if (robot_mode != MODE_WHEEL
 			&& (robot_mode != MODE_RAMP || !WokiRampControl_IsDriveReady())) {
 		Robot_Wheel_Stop();
@@ -266,6 +293,7 @@ void Robot_Wheel_Backward(void) {
 
 // 좌회전 탱크턴
 void Robot_Tank_Left(void) {
+	if (!RobotPower_MotionAllowed()) return;
 	if (robot_mode != MODE_WHEEL) {
 		Robot_Wheel_Stop();
 		return;
@@ -289,6 +317,7 @@ void Robot_Tank_Left(void) {
 
 // 우회전 탱크턴
 void Robot_Tank_Right(void) {
+	if (!RobotPower_MotionAllowed()) return;
 	if (robot_mode != MODE_WHEEL) {
 		Robot_Wheel_Stop();
 		return;
@@ -312,16 +341,17 @@ void Robot_Tank_Right(void) {
 
 // Wheel Mode 전환
 void Robot_Set_Wheel_Mode(void) {
+	if (!dxl_knee_position_is_ready()) return;
 	if (robot_mode == MODE_WALK_DEMO) {
 		return;
 	}
 
 	if (robot_mode == MODE_RAMP) {
+		if (!RobotPower_CheckRunningReference()) return;
 		Robot_Wheel_Stop();
-        if (WokiRampControl_RequestWheelReturn()) {
-            ramp_pending_mode = MODE_WHEEL;
-            Robot_Finish_Ramp_Return();
-        }
+        ramp_pending_mode = MODE_WHEEL;
+        (void) WokiRampControl_RequestWheelReturn();
+        Robot_Finish_Ramp_Return();
 		return;
 	}
 
@@ -333,6 +363,9 @@ void Robot_Set_Wheel_Mode(void) {
 		return;
 	}
 
+	// 실제 전환을 시작할 때만 확인, 무시되는 중복 명령은 기존처럼 바로 반환
+	if (robot_mode == MODE_NONE && !RobotPower_MoveInitialWheelPose()) return;
+	if (robot_mode != MODE_NONE && !RobotPower_CheckRunningReference()) return;
 	RobotMode_t previous_mode = robot_mode;
 	robot_mode = MODE_TO_WHEEL;
 
@@ -341,13 +374,11 @@ void Robot_Set_Wheel_Mode(void) {
 
 	if (previous_mode == MODE_LEG) {
 		Robot_Run_Leg_To_Wheel_Trajectory();
-	} else {
-		// 초기 진입 시 Wheel 시작 자세 적용
-		Robot_Set_Wheel_Pose();
 	}
+	// 최초 진입은 위에서 Wheel 실제 도착까지 완료, 중복 목표·토크 OFF/ON 없음
 
-	// 전환 중 비상정지 시 Wheel Mode 완료 처리 방지
-	if (user_stop_flag) {
+	// 전환 중 정지·초기 도착 확인 실패 시 Wheel Mode 완료 처리 방지
+	if (user_stop_flag || !dxl_knee_position_is_ready()) {
 		robot_mode = MODE_NONE;
 		return;
 	}
@@ -360,6 +391,9 @@ void Robot_Set_Wheel_Mode(void) {
 
 // 경사로 보정 모드 진입
 void Robot_Set_Ramp_Mode(void) {
+	// Wheel↔Leg 시험 허가만으로 미검증 경사로 동작까지 허용하지 않음
+	if (WOKI_KNEE_REFERENCE_VERIFIED != 1U) return;
+	if (!dxl_knee_position_is_ready()) return;
 	if (robot_mode == MODE_RAMP) {
 		Robot_Wheel_Stop();
 		return;
@@ -370,6 +404,7 @@ void Robot_Set_Ramp_Mode(void) {
 		return;
 	}
 
+	if (!RobotPower_CheckRunningReference()) return;
 	Robot_Wheel_Stop();
 	Robot_Set_Leg_Profile(RAMP_PROFILE_ACCELERATION,
 			RAMP_PROFILE_VELOCITY);
@@ -380,6 +415,9 @@ void Robot_Set_Ramp_Mode(void) {
 
 // Leg Mode 전환
 void Robot_Set_Leg_Mode(void) {
+	if (!dxl_knee_position_is_ready()) return;
+	// 시작 허가 직후에는 기존 Wheel 진입을 먼저 수행, 주차 자세에서 Leg 경로로 점프 방지
+	if (robot_mode == MODE_NONE) return;
 	if (robot_mode == MODE_WALK_DEMO) {
 		return;
 	}
@@ -393,14 +431,15 @@ void Robot_Set_Leg_Mode(void) {
 	}
 
 	if (robot_mode == MODE_RAMP) {
+		if (!RobotPower_CheckRunningReference()) return;
 		Robot_Wheel_Stop();
-        if (WokiRampControl_RequestWheelReturn()) {
-            ramp_pending_mode = MODE_LEG;
-            Robot_Finish_Ramp_Return();
-        }
+        ramp_pending_mode = MODE_LEG;
+        (void) WokiRampControl_RequestWheelReturn();
+        Robot_Finish_Ramp_Return();
         return;
 	}
 
+	if (!RobotPower_CheckRunningReference()) return;
 	robot_mode = MODE_TO_LEG;
 
 	Robot_Wheel_Stop();
@@ -434,7 +473,7 @@ static void Robot_Finish_Ramp_Return(void)
 }
 
 // 기본 Wheel 자세 및 경사로 복귀 목표
-void Robot_Get_Wheel_Pose_Targets(uint32_t target[12])
+void Robot_Get_Wheel_Pose_Targets(int32_t target[12])
 {
     const uint32_t wheel_pose[12] = {
         2048, 2048, 2691,  // leg1: FL
@@ -444,54 +483,21 @@ void Robot_Get_Wheel_Pose_Targets(uint32_t target[12])
     };
     uint32_t i;
     if (target == 0) return;
-    for (i = 0; i < 12U; ++i) target[i] = wheel_pose[i];
+    for (i = 0; i < 12U; ++i)
+        target[i] = WokiJoint_IsKneeIndex(i)
+                ? WokiJoint_RoundRaw(WokiJoint_KneeReference(i / 3U))
+                : (int32_t)wheel_pose[i];
 }
 
-// Wheel Mode 자세 설정
+// 최초 Wheel 자세 이동, 현재 위치에서 직접 저속 이동 및 실제 도착 확인
 void Robot_Set_Wheel_Pose(void) {
-	uint8_t ids[12] = { legs[1].roll, legs[1].pitch, legs[1].knee, legs[2].roll,
-			legs[2].pitch, legs[2].knee, legs[3].roll, legs[3].pitch,
-			legs[3].knee, legs[4].roll, legs[4].pitch, legs[4].knee };
-
-	uint32_t wheel_pose[12];
-	Robot_Get_Wheel_Pose_Targets(wheel_pose);
-
-	uint32_t profile_acc[12];
-	uint32_t profile_vel[12];
-
-	uint32_t acc_value = first_wheel_pose ? 2 : 5;
-	uint32_t vel_value = first_wheel_pose ? 5 : 10;
-
-	for (int i = 0; i < 12; i++) {
-	    profile_acc[i] = acc_value;
-	    profile_vel[i] = vel_value;
-	}
-
-	uint8_t torque_off[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-
-	uint8_t torque_on[12] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
-
-	dxl_sync_write_1byte(ids, torque_off, 12, DXL_2_Torque_Enable);
-	HAL_Delay(20);
-
-	dxl_sync_write_4byte(ids, profile_acc, 12, DXL_2_Profile_Acceleration);
-	HAL_Delay(20);
-
-	dxl_sync_write_4byte(ids, profile_vel, 12, DXL_2_Profile_Velocity);
-	HAL_Delay(20);
-
-	dxl_sync_write_1byte(ids, torque_on, 12, DXL_2_Torque_Enable);
-	HAL_Delay(100);
-
-	dxl_sync_write_4byte(ids, wheel_pose, 12, DXL_2_Goal_Position);
-	HAL_Delay(WHEEL_POSE_WAIT_TIME_MS);
-
-	// 이후 Wheel 전환부터는 기존 프로파일 사용
-	first_wheel_pose = 0;
+	if (!dxl_knee_position_is_ready()) return;
+	if (robot_mode != MODE_NONE) return;
+	(void)RobotPower_MoveInitialWheelPose();
 }
 
 // MX 목표 위치 범위 제한
-static uint32_t Robot_Wheel_To_Leg_Clamp_Position(float position) {
+static int32_t Robot_Wheel_To_Leg_Clamp_Position(float position) {
 	if (position < 0.0f) {
 		return 0;
 	}
@@ -500,7 +506,7 @@ static uint32_t Robot_Wheel_To_Leg_Clamp_Position(float position) {
 		return 4095;
 	}
 
-	return (uint32_t) (position + 0.5f);
+	return WokiJoint_RoundRaw(position);
 }
 
 // 최소저크 시간 진행률 계산
@@ -517,7 +523,7 @@ static float Robot_Wheel_To_Leg_Minimum_Jerk(float progress) {
 }
 
 // Hip Pitch 각도를 MX 목표 위치로 변환
-static uint32_t Robot_Wheel_To_Leg_Pitch_To_Position(float pitch_deg,
+static int32_t Robot_Wheel_To_Leg_Pitch_To_Position(float pitch_deg,
 		uint8_t left_side) {
 	float position_delta = pitch_deg * WHEEL_TO_LEG_PITCH_POSITION_PER_DEG;
 	float position = left_side ?
@@ -528,16 +534,19 @@ static uint32_t Robot_Wheel_To_Leg_Pitch_To_Position(float pitch_deg,
 }
 
 // Knee 출력축 각도를 MX 목표 위치로 변환
-static uint32_t Robot_Wheel_To_Leg_Knee_To_Position(float knee_deg,
-		uint8_t left_side) {
+static int32_t Robot_Wheel_To_Leg_Knee_To_Position(float knee_deg,
+		uint8_t leg) {
 	float position_delta = (knee_deg - WHEEL_TO_LEG_KNEE_START_DEG)
 			* WHEEL_TO_LEG_KNEE_POSITION_PER_DEG;
 
-	float position = left_side ?
-			WHEEL_TO_LEG_LEFT_KNEE_ZERO_POSITION - position_delta :
-			WHEEL_TO_LEG_RIGHT_KNEE_ZERO_POSITION + position_delta;
-
-	return Robot_Wheel_To_Leg_Clamp_Position(position);
+	float position = WokiJoint_KneeReference(leg)
+			+ (leg % 2U == 0U ? -position_delta : position_delta);
+	const int32_t minimum = WokiJoint_MinRaw(leg * 3U + 2U);
+	const int32_t maximum = WokiJoint_MaxRaw(leg * 3U + 2U);
+	// 기존 관절각 허용 범위만 환산, KNEE를 0~4095로 자르지 않음
+	if (position < (float)minimum) return minimum;
+	if (position > (float)maximum) return maximum;
+	return WokiJoint_RoundRaw(position);
 }
 
 // 접촉 후 뒷다리 121점 경로 보간
@@ -573,7 +582,7 @@ static void Robot_Wheel_To_Leg_Get_Rear_Post_Path(float progress, float *pitch_d
 
 // 경과시간에 따른 Pitch와 Knee 목표 위치 계산
 static void Robot_Wheel_To_Leg_Calculate_Target(uint32_t elapsed_ms,
-		uint32_t *pitch_position, uint32_t *knee_position) {
+		int32_t *pitch_position, int32_t *knee_position) {
 	float front_pitch_deg;
 	float front_knee_deg;
 	float rear_pitch_deg;
@@ -619,15 +628,15 @@ static void Robot_Wheel_To_Leg_Calculate_Target(uint32_t elapsed_ms,
 	pitch_position[3] = Robot_Wheel_To_Leg_Pitch_To_Position(rear_pitch_deg, 0);
 
 	// Knee 목표 위치 순서: FL, FR, RL, RR
-	knee_position[0] = Robot_Wheel_To_Leg_Knee_To_Position(front_knee_deg, 1);
-	knee_position[1] = Robot_Wheel_To_Leg_Knee_To_Position(front_knee_deg, 0);
-	knee_position[2] = Robot_Wheel_To_Leg_Knee_To_Position(rear_knee_deg, 1);
-	knee_position[3] = Robot_Wheel_To_Leg_Knee_To_Position(rear_knee_deg, 0);
+	knee_position[0] = Robot_Wheel_To_Leg_Knee_To_Position(front_knee_deg, 0U);
+	knee_position[1] = Robot_Wheel_To_Leg_Knee_To_Position(front_knee_deg, 1U);
+	knee_position[2] = Robot_Wheel_To_Leg_Knee_To_Position(rear_knee_deg, 2U);
+	knee_position[3] = Robot_Wheel_To_Leg_Knee_To_Position(rear_knee_deg, 3U);
 }
 
 // Leg-to-Wheel Pitch·Knee 목표 위치 계산
 static void Robot_Leg_To_Wheel_Calculate_Target(uint32_t elapsed_ms,
-		uint32_t *pitch_position, uint32_t *knee_position) {
+		int32_t *pitch_position, int32_t *knee_position) {
 	float front_pitch_deg;
 	float front_knee_deg;
 	float rear_pitch_deg;
@@ -676,10 +685,10 @@ static void Robot_Leg_To_Wheel_Calculate_Target(uint32_t elapsed_ms,
 	pitch_position[3] = Robot_Wheel_To_Leg_Pitch_To_Position(rear_pitch_deg, 0);
 
 	// Knee 목표 위치 순서: FL, FR, RL, RR
-	knee_position[0] = Robot_Wheel_To_Leg_Knee_To_Position(front_knee_deg, 1);
-	knee_position[1] = Robot_Wheel_To_Leg_Knee_To_Position(front_knee_deg, 0);
-	knee_position[2] = Robot_Wheel_To_Leg_Knee_To_Position(rear_knee_deg, 1);
-	knee_position[3] = Robot_Wheel_To_Leg_Knee_To_Position(rear_knee_deg, 0);
+	knee_position[0] = Robot_Wheel_To_Leg_Knee_To_Position(front_knee_deg, 0U);
+	knee_position[1] = Robot_Wheel_To_Leg_Knee_To_Position(front_knee_deg, 1U);
+	knee_position[2] = Robot_Wheel_To_Leg_Knee_To_Position(rear_knee_deg, 2U);
+	knee_position[3] = Robot_Wheel_To_Leg_Knee_To_Position(rear_knee_deg, 3U);
 }
 
 // 실행 중 사용자 정지 요청 확인
@@ -696,6 +705,7 @@ static uint8_t Robot_Wheel_To_Leg_Stop_Requested(void) {
 
 // Leg-to-Wheel 궤적 실행
 static void Robot_Run_Leg_To_Wheel_Trajectory(void) {
+	if (!dxl_knee_position_is_ready()) return;
 	uint8_t roll_ids[4] = {
 			legs[1].roll, legs[2].roll,
 			legs[3].roll, legs[4].roll
@@ -711,7 +721,7 @@ static void Robot_Run_Leg_To_Wheel_Trajectory(void) {
 			legs[3].knee, legs[4].knee
 			};
 
-	uint32_t roll_pose[4] = {
+	int32_t roll_pose[4] = {
 			2048,  // ID 1  : FL Roll
 			2048,  // ID 11 : FR Roll
 			2048,  // ID 21 : RL Roll
@@ -720,8 +730,8 @@ static void Robot_Run_Leg_To_Wheel_Trajectory(void) {
 
 	uint32_t profile_disabled[4] = { 0, 0, 0, 0 };
 	uint8_t torque_on[4] = { 1, 1, 1, 1 };
-	uint32_t pitch_position[4];
-	uint32_t knee_position[4];
+	int32_t pitch_position[4];
+	int32_t knee_position[4];
 
 	// 전환 중 AX 바퀴 정지 유지
 	Robot_Wheel_Stop();
@@ -742,7 +752,7 @@ static void Robot_Run_Leg_To_Wheel_Trajectory(void) {
 	dxl_sync_write_1byte(knee_ids, torque_on, 4, DXL_2_Torque_Enable);
 
 	// Roll의 Wheel 자세 영점 유지
-	dxl_sync_write_4byte(roll_ids, roll_pose, 4, DXL_2_Goal_Position);
+	(void)dxl_sync_write_goal_positions_checked(roll_ids, roll_pose, 4U);
 
 	uint32_t start_tick = HAL_GetTick();
 
@@ -767,15 +777,15 @@ static void Robot_Run_Leg_To_Wheel_Trajectory(void) {
 		Robot_Leg_To_Wheel_Calculate_Target(elapsed_ms, pitch_position,
 				knee_position);
 
-		dxl_sync_write_4byte(pitch_ids, pitch_position, 4,
-				DXL_2_Goal_Position);
-		dxl_sync_write_4byte(knee_ids, knee_position, 4,
-				DXL_2_Goal_Position);
+		(void)dxl_sync_write_goal_positions_checked(pitch_ids, pitch_position, 4U);
+		(void)dxl_sync_write_goal_positions_checked(knee_ids, knee_position, 4U);
 	}
 }
 
 // Leg Mode 자세 설정
 void Robot_Set_Leg_Pose(void) {
+	if (!dxl_knee_position_is_ready()) return;
+	if (robot_mode == MODE_NONE) return;
 	uint8_t roll_ids[4] = {
 			legs[1].roll, legs[2].roll,
 			legs[3].roll, legs[4].roll
@@ -791,7 +801,7 @@ void Robot_Set_Leg_Pose(void) {
 			legs[3].knee, legs[4].knee
 			};
 
-	uint32_t roll_pose[4] = {
+	int32_t roll_pose[4] = {
 			2048,  // ID 1  : FL Roll
 			2048,  // ID 11 : FR Roll
 			2048,  // ID 21 : RL Roll
@@ -800,8 +810,8 @@ void Robot_Set_Leg_Pose(void) {
 
 	uint32_t profile_disabled[4] = { 0, 0, 0, 0 };
 	uint8_t torque_on[4] = { 1, 1, 1, 1 };
-	uint32_t pitch_position[4];
-	uint32_t knee_position[4];
+	int32_t pitch_position[4];
+	int32_t knee_position[4];
 
 	// 무부하 시험에서는 AX 바퀴 출력을 0으로 유지
 	Robot_Wheel_Stop();
@@ -822,7 +832,7 @@ void Robot_Set_Leg_Pose(void) {
 	dxl_sync_write_1byte(knee_ids, torque_on, 4, DXL_2_Torque_Enable);
 
 	// Roll 목표 위치 설정
-	dxl_sync_write_4byte(roll_ids, roll_pose, 4, DXL_2_Goal_Position);
+	(void)dxl_sync_write_goal_positions_checked(roll_ids, roll_pose, 4U);
 
 	uint32_t start_tick = HAL_GetTick();
 
@@ -847,10 +857,8 @@ void Robot_Set_Leg_Pose(void) {
 		Robot_Wheel_To_Leg_Calculate_Target(elapsed_ms, pitch_position,
 				knee_position);
 
-		dxl_sync_write_4byte(pitch_ids, pitch_position, 4,
-				DXL_2_Goal_Position);
-		dxl_sync_write_4byte(knee_ids, knee_position, 4,
-				DXL_2_Goal_Position);
+		(void)dxl_sync_write_goal_positions_checked(pitch_ids, pitch_position, 4U);
+		(void)dxl_sync_write_goal_positions_checked(knee_ids, knee_position, 4U);
 	}
 }
 
@@ -871,9 +879,9 @@ static void Robot_Walk_Demo_Get_Ids(uint8_t ids[12]) {
 }
 
 // Leg 자세 목표 위치 계산
-static void Robot_Walk_Demo_Get_Leg_Target(uint32_t target[12]) {
-	uint32_t pitch_position[4];
-	uint32_t knee_position[4];
+static void Robot_Walk_Demo_Get_Leg_Target(int32_t target[12]) {
+	int32_t pitch_position[4];
+	int32_t knee_position[4];
 
 	Robot_Wheel_To_Leg_Calculate_Target(WHEEL_TO_LEG_TOTAL_TIME_MS,
 			pitch_position, knee_position);
@@ -888,14 +896,16 @@ static void Robot_Walk_Demo_Get_Leg_Target(uint32_t target[12]) {
 // 촬영용 보행 목표 위치 전송
 static void Robot_Walk_Demo_Send_Target(void) {
 	uint8_t ids[12];
-	uint32_t send_target[12];
+	int32_t send_target[12];
 
 	Robot_Walk_Demo_Get_Ids(ids);
 	for (uint32_t i = 0U; i < 12U; ++i) {
 		send_target[i] = walk_demo_target_raw[i];
 	}
-	if (send_target[WALK_DEMO_ID3_INDEX] < WALK_DEMO_ID3_MIN_RAW) {
-		send_target[WALK_DEMO_ID3_INDEX] = WALK_DEMO_ID3_MIN_RAW;
+	const int32_t id3_minimum = WokiJoint_LegacyPosition(WALK_DEMO_ID3_INDEX,
+			(float)WALK_DEMO_ID3_MIN_RAW);
+	if (send_target[WALK_DEMO_ID3_INDEX] < id3_minimum) {
+		send_target[WALK_DEMO_ID3_INDEX] = id3_minimum;
 	}
 	if (!dxl_sync_write_goal_positions_checked(ids, send_target, 12U)) {
 		robot_walk_demo_status.tx_fail_count++;
@@ -904,6 +914,9 @@ static void Robot_Walk_Demo_Send_Target(void) {
 
 // 촬영용 3스텝 시작
 uint8_t Robot_Start_Walk_Demo(void) {
+	// Wheel↔Leg 시험 중에는 촬영용 보행을 시작하지 않음
+	if (WOKI_KNEE_REFERENCE_VERIFIED != 1U) return 0U;
+	if (!dxl_knee_position_is_ready()) return 0U;
 	uint8_t ids[12];
 	uint8_t torque_on[12];
 	uint32_t profile_disabled[12];
@@ -911,6 +924,7 @@ uint8_t Robot_Start_Walk_Demo(void) {
 	if (robot_mode != MODE_LEG || robot_walk_demo_status.active) {
 		return 0U;
 	}
+	if (!RobotPower_CheckRunningReference()) return 0U;
 
 	Robot_Wheel_Stop();
 	Robot_Walk_Demo_Get_Ids(ids);
@@ -958,8 +972,34 @@ void Robot_Stop_Walk_Demo(void) {
 	robot_mode = MODE_LEG;
 }
 
+// 압축된 변화량에서 원본 샘플 한 개 적용
+static void Robot_Walk_Demo_Apply_Next_Delta(void) {
+	if (walk_demo_zero_remaining > 0U) {
+		walk_demo_zero_remaining--;
+		return;
+	}
+	if (walk_demo_delta_event_index >= WOKI_WALK_DEMO_DELTA_EVENT_COUNT) {
+		return; // 마지막 목표 유지 구간
+	}
+
+	const WokiWalkDemoDeltaEvent *event =
+			&woki_walk_demo_delta_events[walk_demo_delta_event_index];
+	for (uint32_t i = 0U; i < 12U; ++i) {
+		walk_demo_legacy_target_raw[i] +=
+				(int32_t)event->delta_raw[i] * WALK_DEMO_ANGLE_SCALE;
+		walk_demo_target_raw[i] = WokiJoint_LegacyPosition(i,
+				(float)walk_demo_legacy_target_raw[i]);
+	}
+	walk_demo_delta_event_index++;
+	if (walk_demo_delta_event_index < WOKI_WALK_DEMO_DELTA_EVENT_COUNT) {
+		walk_demo_zero_remaining =
+				woki_walk_demo_delta_events[walk_demo_delta_event_index].zero_before;
+	}
+}
+
 // 촬영용 3스텝 제어
 void Robot_Walk_Demo_Task(void) {
+	if (!RobotPower_MotionAllowed()) return;
 	uint32_t current_time;
 
 	if (robot_mode != MODE_WALK_DEMO || !robot_walk_demo_status.active) {
@@ -979,11 +1019,15 @@ void Robot_Walk_Demo_Task(void) {
 
 		if (elapsed_ms >= WALK_DEMO_ENTER_TIME_MS) {
 			for (uint32_t i = 0U; i < 12U; ++i) {
-				walk_demo_target_raw[i] = woki_walk_demo_first_raw[i];
+				walk_demo_legacy_target_raw[i] = woki_walk_demo_first_raw[i];
+				walk_demo_target_raw[i] = WokiJoint_LegacyPosition(i,
+						(float)walk_demo_legacy_target_raw[i]);
 			}
 			Robot_Walk_Demo_Send_Target();
 			walk_demo_phase_start_ms = current_time;
 			walk_demo_speed_accumulator = 0U;
+			walk_demo_delta_event_index = 0U;
+			walk_demo_zero_remaining = woki_walk_demo_delta_events[0].zero_before;
 			robot_walk_demo_status.state = WALK_DEMO_PLAYING;
 			robot_walk_demo_status.elapsed_ms = 0U;
 			return;
@@ -993,9 +1037,9 @@ void Robot_Walk_Demo_Task(void) {
 				(float) elapsed_ms / (float) WALK_DEMO_ENTER_TIME_MS);
 		for (uint32_t i = 0U; i < 12U; ++i) {
 			float position = (float) walk_demo_start_raw[i]
-					+ ((float) woki_walk_demo_first_raw[i]
+					+ (WokiJoint_FromLegacyRaw(i, (float)woki_walk_demo_first_raw[i])
 							- (float) walk_demo_start_raw[i]) * progress;
-			walk_demo_target_raw[i] = (uint32_t) (position + 0.5f);
+			walk_demo_target_raw[i] = WokiJoint_RoundRaw(position);
 		}
 		robot_walk_demo_status.elapsed_ms = elapsed_ms;
 		Robot_Walk_Demo_Send_Target();
@@ -1013,14 +1057,7 @@ void Robot_Walk_Demo_Task(void) {
 	while (advance_count > 0U
 			&& robot_walk_demo_status.sample_index + 1U
 					< WOKI_WALK_DEMO_SAMPLE_COUNT) {
-		uint32_t delta_index = robot_walk_demo_status.sample_index;
-
-		for (uint32_t i = 0U; i < 12U; ++i) {
-			int32_t position = (int32_t) walk_demo_target_raw[i]
-					+ (int32_t) woki_walk_demo_delta_raw[delta_index][i]
-							* WALK_DEMO_ANGLE_SCALE;
-			walk_demo_target_raw[i] = (uint32_t) position;
-		}
+		Robot_Walk_Demo_Apply_Next_Delta();
 		robot_walk_demo_status.sample_index++;
 		advance_count--;
 	}

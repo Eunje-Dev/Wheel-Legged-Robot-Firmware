@@ -46,7 +46,7 @@ typedef struct {
     float knee_ref_usd_deg[4];
     float knee_ref_raw[4];
     // 모터 저장 한계와 기구·경로 허용 범위의 공통 구간
-    uint32_t min_raw[12], max_raw[12];
+    int32_t min_raw[12], max_raw[12];
     float command_rate_raw_s[12];  // 목표 위치 변화 속도 (엔코더 값/초)
     uint32_t settle_tolerance_raw[12]; // 목표 도착 허용 오차
     uint32_t tracking_tolerance_raw[12]; // 지속 오류 판정 허용 오차
@@ -75,21 +75,21 @@ typedef struct {
     uint32_t last_ms, phase_start_ms, duration_ms, error_since_ms, settled_since_ms;
     uint32_t path_paused_ms;
     float command_raw[12], start_raw[12], target_raw[12];
-    uint32_t wheel_raw[12];
+    int32_t wheel_raw[12];
     WokiRampMotionConfig config;
 } WokiRampMotion;
 
 void WokiRampMotion_DefaultConfig(WokiRampMotionConfig *config);
 uint8_t WokiRampMotion_ConfigValid(const WokiRampMotionConfig *config);
 uint8_t WokiRampMotion_Encode(const WokiRampMotionConfig *config,
-        const WokiSlopeOutput *target, uint32_t raw[12]);
+        const WokiSlopeOutput *target, int32_t raw[12]);
 void WokiRampMotion_Reset(WokiRampMotion *motion);
 uint8_t WokiRampMotion_Begin(WokiRampMotion *motion,
-        const WokiRampMotionConfig *config, const uint32_t wheel_raw[12],
+        const WokiRampMotionConfig *config, const int32_t wheel_raw[12],
         const WokiRampMotionFrame *frame);
 uint8_t WokiRampMotion_RequestReturn(WokiRampMotion *motion,
         const WokiRampMotionFrame *frame);
 uint8_t WokiRampMotion_Update(WokiRampMotion *motion,
-        const WokiRampMotionFrame *frame, uint32_t target_raw[12]);
+        const WokiRampMotionFrame *frame, int32_t target_raw[12]);
 void WokiRampMotion_Fail(WokiRampMotion *motion, WokiRampMotionFault fault);
 #endif

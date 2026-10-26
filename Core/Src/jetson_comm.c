@@ -9,6 +9,7 @@
 #include "woki_ramp_control.h"
 #include "imu_driver.h"
 #include "dxl_2_0.h"
+#include "woki_power_guard.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,6 +104,13 @@ static void Jetson_QueueLine_FromISR(void)
 {
     const RobotMode_t mode = Robot_Get_Mode();
     uint8_t stop_request = JETSON_STOP_NONE;
+
+    // 전원 절차 명령 수신 시 앞서 대기 중인 동작 명령을 무효화
+    if (strcmp(rx_line, "PREPARE_POWER_OFF") == 0
+            || strcmp(rx_line, "CANCEL_POWER_OFF") == 0
+            || strcmp(rx_line, "CONFIRM_START_SUPPORTED") == 0
+            || strcmp(rx_line, "CONFIRM_POWER_OFF_SUPPORTED") == 0)
+        Jetson_ClearQueue_Unlocked();
 
     if (strcmp(rx_line, "WHEEL_STOP") == 0
             && (mode == MODE_WHEEL || mode == MODE_RAMP)) {
@@ -751,34 +759,68 @@ static void Jetson_Stop_Motor_State_Stream(void) {
 	}
 }
 
-// 현재 모터 속도 송신
-static void Jetson_Send_Motor_Velocity(const char *id_text) {
+// 모터 조회 명령의 ID 변환 및 검사
+static uint8_t Jetson_Parse_Motor_ID(const char *id_text,
+		const char *response_name, uint8_t allow_broadcast, uint8_t *id) {
 	char *end_ptr;
-	unsigned long id_value;
-	uint8_t velocity_data[4];
-	uint8_t device_error = 0xFF;
-	uint8_t fail_stage = DXL_READ_FAIL_NONE;
-	char tx_line[96];
+	unsigned long id_value = strtoul(id_text, &end_ptr, 10);
+	uint8_t broadcast = allow_broadcast && id_value == 254U;
 
-	id_value = strtoul(id_text, &end_ptr, 10);
-
-	if (id_text == end_ptr || *end_ptr != '\0' || id_value > 252
-			|| !Jetson_Is_Leg_Motor_ID((uint8_t) id_value)) {
-		Jetson_Send_Text("MOTOR_VEL:VALID=0,REASON=ID\r\n");
-		return;
-	}
-
-	uint8_t id = (uint8_t) id_value;
-
-	if (!dxl_read_2_0(id, DXL_2_Present_Velocity, 4, velocity_data,
-			&device_error, &fail_stage)) {
+	if (id_text == end_ptr || *end_ptr != '\0'
+			|| (!broadcast && (id_value > 252U
+					|| !Jetson_Is_Leg_Motor_ID((uint8_t) id_value)))) {
+		char tx_line[64];
 		int length = snprintf(tx_line, sizeof(tx_line),
-				"MOTOR_VEL:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
-				(unsigned int) id, (unsigned int) fail_stage);
-
+				"%s:VALID=0,REASON=ID\r\n", response_name);
 		if (length > 0 && length < (int) sizeof(tx_line)) {
 			Jetson_Send_Text(tx_line);
 		}
+		return 0U;
+	}
+
+	*id = (uint8_t) id_value;
+	return 1U;
+}
+
+// 모터 조회 통신 실패 응답, 기존 명령별 형식 유지
+static void Jetson_Send_Motor_Comm_Error(const char *response_name,
+		uint8_t id, uint8_t fail_stage) {
+	char tx_line[96];
+	int length = snprintf(tx_line, sizeof(tx_line),
+			"%s:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
+			response_name, (unsigned int) id, (unsigned int) fail_stage);
+
+	if (length > 0 && length < (int) sizeof(tx_line)) {
+		Jetson_Send_Text(tx_line);
+	}
+}
+
+// 개별 모터 레지스터 조회 및 실패 처리
+static uint8_t Jetson_Read_Motor_Register(uint8_t id, uint16_t address,
+		uint16_t size, uint8_t *data, uint8_t *device_error,
+		const char *response_name) {
+	uint8_t fail_stage = DXL_READ_FAIL_NONE;
+
+	if (!dxl_read_2_0(id, address, size, data, device_error, &fail_stage)) {
+		Jetson_Send_Motor_Comm_Error(response_name, id, fail_stage);
+		return 0U;
+	}
+	return 1U;
+}
+
+// 현재 모터 속도 송신
+static void Jetson_Send_Motor_Velocity(const char *id_text) {
+	uint8_t id;
+	uint8_t velocity_data[4];
+	uint8_t device_error = 0xFF;
+	char tx_line[96];
+
+	if (!Jetson_Parse_Motor_ID(id_text, "MOTOR_VEL", 0U, &id)) {
+		return;
+	}
+
+	if (!Jetson_Read_Motor_Register(id, DXL_2_Present_Velocity, 4U,
+			velocity_data, &device_error, "MOTOR_VEL")) {
 		return;
 	}
 
@@ -798,32 +840,17 @@ static void Jetson_Send_Motor_Velocity(const char *id_text) {
 
 // 현재 모터 전류 송신
 static void Jetson_Send_Motor_Current(const char *id_text) {
-	char *end_ptr;
-	unsigned long id_value;
+	uint8_t id;
 	uint8_t current_data[2];
 	uint8_t device_error = 0xFF;
-	uint8_t fail_stage = DXL_READ_FAIL_NONE;
 	char tx_line[128];
 
-	id_value = strtoul(id_text, &end_ptr, 10);
-
-	if (id_text == end_ptr || *end_ptr != '\0' || id_value > 252
-			|| !Jetson_Is_Leg_Motor_ID((uint8_t) id_value)) {
-		Jetson_Send_Text("MOTOR_CURRENT:VALID=0,REASON=ID\r\n");
+	if (!Jetson_Parse_Motor_ID(id_text, "MOTOR_CURRENT", 0U, &id)) {
 		return;
 	}
 
-	uint8_t id = (uint8_t) id_value;
-
-	if (!dxl_read_2_0(id, DXL_2_Present_Current, 2, current_data, &device_error,
-			&fail_stage)) {
-		int length = snprintf(tx_line, sizeof(tx_line),
-				"MOTOR_CURRENT:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
-				(unsigned int) id, (unsigned int) fail_stage);
-
-		if (length > 0 && length < (int) sizeof(tx_line)) {
-			Jetson_Send_Text(tx_line);
-		}
+	if (!Jetson_Read_Motor_Register(id, DXL_2_Present_Current, 2U,
+			current_data, &device_error, "MOTOR_CURRENT")) {
 		return;
 	}
 
@@ -844,32 +871,17 @@ static void Jetson_Send_Motor_Current(const char *id_text) {
 
 // 모터 하드웨어 에러 상태 송신
 static void Jetson_Send_Motor_Hardware_Error(const char *id_text) {
-	char *end_ptr;
-	unsigned long id_value;
+	uint8_t id;
 	uint8_t hardware_error = 0U;
 	uint8_t device_error = 0xFFU;
-	uint8_t fail_stage = DXL_READ_FAIL_NONE;
 	char tx_line[96];
 
-	id_value = strtoul(id_text, &end_ptr, 10);
-
-	if (id_text == end_ptr || *end_ptr != '\0' || id_value > 252
-			|| !Jetson_Is_Leg_Motor_ID((uint8_t) id_value)) {
-		Jetson_Send_Text("MOTOR_ERROR:VALID=0,REASON=ID\r\n");
+	if (!Jetson_Parse_Motor_ID(id_text, "MOTOR_ERROR", 0U, &id)) {
 		return;
 	}
 
-	uint8_t id = (uint8_t) id_value;
-
-	if (!dxl_read_2_0(id, DXL_2_Hardware_Error_Status, 1, &hardware_error,
-			&device_error, &fail_stage)) {
-		int length = snprintf(tx_line, sizeof(tx_line),
-				"MOTOR_ERROR:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
-				(unsigned int) id, (unsigned int) fail_stage);
-
-		if (length > 0 && length < (int) sizeof(tx_line)) {
-			Jetson_Send_Text(tx_line);
-		}
+	if (!Jetson_Read_Motor_Register(id, DXL_2_Hardware_Error_Status, 1U,
+			&hardware_error, &device_error, "MOTOR_ERROR")) {
 		return;
 	}
 
@@ -1040,31 +1052,17 @@ static void Jetson_Dump_Actuator_Config(void) {
 
 // 모터 Ping 결과 송신
 static void Jetson_Send_Motor_Ping(const char *id_text) {
-	char *end_ptr;
-	unsigned long id_value;
+	uint8_t id;
 	uint8_t device_error = 0xFF;
 	uint8_t fail_stage = DXL_READ_FAIL_NONE;
 	char tx_line[96];
 
-	id_value = strtoul(id_text, &end_ptr, 10);
-
-	if (id_text == end_ptr || *end_ptr != '\0'
-			|| (id_value > 252 && id_value != 254)
-			|| (id_value != 254 && !Jetson_Is_Leg_Motor_ID((uint8_t) id_value))) {
-		Jetson_Send_Text("MOTOR_PING:VALID=0,REASON=ID\r\n");
+	if (!Jetson_Parse_Motor_ID(id_text, "MOTOR_PING", 1U, &id)) {
 		return;
 	}
 
-	uint8_t id = (uint8_t) id_value;
-
 	if (!dxl_ping_2_0(id, &device_error, &fail_stage)) {
-		int length = snprintf(tx_line, sizeof(tx_line),
-				"MOTOR_PING:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
-				(unsigned int) id, (unsigned int) fail_stage);
-
-		if (length > 0 && length < (int) sizeof(tx_line)) {
-			Jetson_Send_Text(tx_line);
-		}
+		Jetson_Send_Motor_Comm_Error("MOTOR_PING", id, fail_stage);
 		return;
 	}
 
@@ -1079,32 +1077,17 @@ static void Jetson_Send_Motor_Ping(const char *id_text) {
 
 // 현재 모터 위치 송신
 static void Jetson_Send_Motor_Position(const char *id_text) {
-	char *end_ptr;
-	unsigned long id_value;
+	uint8_t id;
 	uint8_t position_data[4];
 	uint8_t device_error = 0xFF;
-	uint8_t fail_stage = DXL_READ_FAIL_NONE;
 	char tx_line[96];
 
-	id_value = strtoul(id_text, &end_ptr, 10);
-
-	if (id_text == end_ptr || *end_ptr != '\0' || id_value > 252
-			|| !Jetson_Is_Leg_Motor_ID((uint8_t) id_value)) {
-		Jetson_Send_Text("MOTOR:VALID=0,REASON=ID\r\n");
+	if (!Jetson_Parse_Motor_ID(id_text, "MOTOR", 0U, &id)) {
 		return;
 	}
 
-	uint8_t id = (uint8_t) id_value;
-
-	if (!dxl_read_2_0(id, DXL_2_Present_Position, 4, position_data,
-			&device_error, &fail_stage)) {
-		int length = snprintf(tx_line, sizeof(tx_line),
-				"MOTOR:ID=%u,VALID=0,REASON=COMM,STAGE=%u\r\n",
-				(unsigned int) id, (unsigned int) fail_stage);
-
-		if (length > 0 && length < (int) sizeof(tx_line)) {
-			Jetson_Send_Text(tx_line);
-		}
+	if (!Jetson_Read_Motor_Register(id, DXL_2_Present_Position, 4U,
+			position_data, &device_error, "MOTOR")) {
 		return;
 	}
 
@@ -1120,6 +1103,34 @@ static void Jetson_Send_Motor_Position(const char *id_text) {
 	if (length > 0 && length < (int) sizeof(tx_line)) {
 		Jetson_Send_Text(tx_line);
 	}
+}
+
+// 외부 지지 확인을 뜻하는 명시적 설정 명령, 부팅·일반 WHEEL/LEG 명령과 별도
+static void Jetson_Configure_Knee_Extended(void)
+{
+    DXL_Knee_Mode_Config_Result_t result;
+    char response[256];
+    if (Robot_Get_Mode() != MODE_NONE) {
+        Jetson_Send_Text("KNEE_MODE_CONFIG:VALID=0,REASON=MODE_NOT_NONE\r\n");
+        return;
+    }
+    if (jetson_motor_state_stream_enabled || jetson_motor_state_tx_busy) {
+        Jetson_Send_Text("KNEE_MODE_CONFIG:VALID=0,REASON=STOP_STREAM_FIRST\r\n");
+        return;
+    }
+    // 설정 중 들어온 다른 동작 명령은 종료 후 폐기
+    Jetson_Comm_DiscardPendingCommands();
+    const uint8_t valid = dxl_configure_knee_extended_mode(&result);
+    Jetson_Comm_DiscardPendingCommands();
+    const int length = snprintf(response, sizeof(response),
+            "KNEE_MODE_CONFIG:VALID=%u,MODE=4,MASK=0x%X,TORQUE_OFF_MASK=0x%X,"
+            "RESTORED_MASK=0x%X,FAILED_ID=%u,STAGE=%u,STATUS_ERR=%u,READ_STAGE=%u,STOPPED=%u\r\n",
+            (unsigned int)valid, (unsigned int)result.mode_mask,
+            (unsigned int)result.torque_off_mask, (unsigned int)result.restored_mask,
+            (unsigned int)result.failed_id, (unsigned int)result.stage,
+            (unsigned int)result.device_error, (unsigned int)result.read_fail_stage,
+            (unsigned int)result.stopped);
+    if (length > 0 && length < (int)sizeof(response)) Jetson_Send_Text(response);
 }
 
 // Jetson 통신 초기화
@@ -1219,6 +1230,24 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 }
 
 // Jetson 명령 처리
+static void Jetson_Send_Power_State(uint8_t accepted)
+{
+    static const char *const names[] = {
+        "LOCKED", "CHECKING", "READY", "PARKING", "PARKED", "SAFE_OFF", "FAULT"
+    };
+    char response[240];
+    const uint32_t phase = (uint32_t)robot_power_status.state;
+    const int length = snprintf(response, sizeof(response),
+            "POWER:STATE=%s,ACCEPTED=%u,ERROR=%u,ID=%u,POSE_CONFIG=%u,PATH_CONFIG=%u,"
+            "SAFE_TO_POWER_OFF=%u,HOLD_SENT=%u\r\n",
+            phase < 7U ? names[phase] : "INVALID", (unsigned)accepted,
+            (unsigned)robot_power_status.error, (unsigned)robot_power_status.failed_id,
+            (unsigned)WOKI_POWER_PARK_POSE_VERIFIED,
+            (unsigned)WOKI_POWER_PARK_PATH_VERIFIED,
+            (unsigned)RobotPower_SafeToPowerOff(), (unsigned)robot_power_status.hold_sent);
+    if (length > 0 && length < (int)sizeof(response)) Jetson_Send_Text(response);
+}
+
 void Jetson_Comm_Task(void) {
     char command[sizeof(rx_line)];
     uint32_t epoch = 0U;
@@ -1230,6 +1259,9 @@ void Jetson_Comm_Task(void) {
         return;
     }
     if (safety_stop) {
+        // 기존 주행 대기열 오류의 정지 동작 유지, 주차 중에만 전원 절차도 취소
+        if (RobotPower_IsParking() || robot_power_status.state == ROBOT_POWER_PARKED
+                || robot_power_status.state == ROBOT_POWER_SAFE_OFF) RobotPower_Cancel();
         Robot_Stop_Walk_Demo();
         Robot_Wheel_Stop();
         return;
@@ -1241,8 +1273,40 @@ void Jetson_Comm_Task(void) {
     }
     const RobotMode_t current_mode = Robot_Get_Mode();
 
+    // 기준 확인 전·주차 중에는 주행 명령 차단, 조회·정지 명령은 유지
+    const uint8_t stop_command = strcmp(command, "WHEEL_STOP") == 0
+            || strcmp(command, "LEG_STOP") == 0;
+    if (Jetson_Is_Motion_Command(command) && !stop_command
+            && !RobotPower_MotionAllowed()) {
+        Jetson_Send_Power_State(0U);
+        return;
+    }
+    if (stop_command && !RobotPower_MotionAllowed()) {
+        RobotPower_Cancel();
+        Jetson_Comm_DiscardPendingCommands();
+        Jetson_Send_Power_State(1U);
+        return;
+    }
+
 	if (strcmp(command, "PING") == 0) {
 		Jetson_Send_Text("OK\r\n");
+	} else if (strcmp(command, "GET_POWER_STATE") == 0) {
+		Jetson_Send_Power_State(1U);
+	} else if (strcmp(command, "CONFIRM_START_SUPPORTED") == 0
+			|| strcmp(command, "PREPARE_POWER_OFF") == 0
+			|| strcmp(command, "CONFIRM_POWER_OFF_SUPPORTED") == 0
+			|| strcmp(command, "CANCEL_POWER_OFF") == 0) {
+		uint8_t accepted = 0U;
+		Jetson_Comm_DiscardPendingCommands();
+		if (strcmp(command, "CONFIRM_START_SUPPORTED") == 0)
+			accepted = RobotPower_ConfirmStartSupported();
+		else if (strcmp(command, "PREPARE_POWER_OFF") == 0)
+			accepted = RobotPower_PreparePowerOff();
+		else if (strcmp(command, "CONFIRM_POWER_OFF_SUPPORTED") == 0)
+			accepted = RobotPower_ConfirmPowerOffSupported();
+		else { RobotPower_Cancel(); accepted = 1U; }
+		Jetson_Comm_DiscardPendingCommands();
+		Jetson_Send_Power_State(accepted);
 	} else if (strcmp(command, "GET_IMU") == 0) {
 		Jetson_Send_IMU();
 	} else if (strcmp(command,
@@ -1263,6 +1327,16 @@ void Jetson_Comm_Task(void) {
 		Jetson_Send_All_Motor_State();
 	} else if (strcmp(command, "DUMP_ACTUATOR_CONFIG") == 0) {
 		Jetson_Dump_Actuator_Config();
+	} else if (strcmp(command, "SET_KNEE_EXTENDED_SUPPORTED") == 0) {
+		if (current_mode != MODE_NONE || RobotPower_IsParking()
+				|| robot_power_status.state == ROBOT_POWER_PARKED
+				|| robot_power_status.state == ROBOT_POWER_SAFE_OFF) {
+			Jetson_Send_Power_State(0U);
+		} else {
+			RobotPower_InvalidateReference();
+			Jetson_Comm_DiscardPendingCommands();
+			Jetson_Configure_Knee_Extended();
+		}
 	} else if (strncmp(command, "PING_MOTOR:", 11) == 0) {
 		Jetson_Send_Motor_Ping(command + 11);
 	} else if (strncmp(command, "GET_MOTOR_CURRENT:", 18) == 0) {
@@ -1279,7 +1353,9 @@ void Jetson_Comm_Task(void) {
 	} else if (strcmp(command, "RAMP") == 0) {
         if (current_mode == MODE_WHEEL) Robot_Set_Ramp_Mode();
 	} else if (strcmp(command, "LEG") == 0) {
-		Robot_Set_Leg_Mode();
+		if (current_mode == MODE_NONE)
+			Jetson_Send_Text("POWER:ACCEPTED=0,REASON=ENTER_WHEEL_FIRST\r\n");
+		else Robot_Set_Leg_Mode();
 	} else if (strcmp(command, "WHEEL_FWD") == 0) {
         if (current_mode == MODE_WHEEL || current_mode == MODE_RAMP) {
             Robot_Wheel_Forward();
@@ -1309,4 +1385,7 @@ void Jetson_Comm_Task(void) {
             Robot_Stop_Walk_Demo();
         }
 	}
+
+    // 일반 명령이 계속 들어와도 예정된 100Hz 상태 송신을 함께 처리
+    if (!jetson_rx_recovery_pending) Jetson_Motor_State_Stream_Task();
 }

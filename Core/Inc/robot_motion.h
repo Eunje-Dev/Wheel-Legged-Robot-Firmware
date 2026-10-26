@@ -38,6 +38,9 @@ extern volatile RobotWalkDemoStatus_t robot_walk_demo_status;
 // 로봇 동작 초기화
 void Robot_Motion_Init(void);
 
+// 전원 기준 잠금·주차 진입 시 로컬 동작 중단, 관절 토크는 유지
+void Robot_Power_StopLocalMotion(void);
+
 // AX 바퀴 정지
 void Robot_Wheel_Stop(void);
 
@@ -70,7 +73,7 @@ void Robot_Tank_Right(void);
 
 // Wheel Mode 자세 설정
 void Robot_Set_Wheel_Pose(void);
-void Robot_Get_Wheel_Pose_Targets(uint32_t target[12]);
+void Robot_Get_Wheel_Pose_Targets(int32_t target[12]);
 
 // Leg Mode 자세 설정
 void Robot_Set_Leg_Pose(void);

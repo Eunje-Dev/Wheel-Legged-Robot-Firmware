@@ -14,8 +14,6 @@ extern volatile uint8_t user_stop_flag;
 #define WOKI_RAMP_ALL_MOTOR_VALID_MASK       0x0FFFU
 #define WOKI_RAMP_DXL_ZERO_COUNT             2048.0f
 #define WOKI_RAMP_DXL_COUNTS_PER_DEG         (4096.0f / 360.0f)
-#define WOKI_RAMP_RAD_TO_DEG                 57.29577951308232088f
-#define WOKI_RAMP_QUATERNION_MIN_NORM_SQ     1.0e-12f
 #define WOKI_RAMP_IMU_FILTER_ALPHA           0.2f
 #define WOKI_RAMP_IMU_DEADBAND_DEG           0.5f
 
@@ -77,54 +75,7 @@ static float WokiRamp_WrapDeg(float angle_deg)
 	return angle_deg;
 }
 
-static uint8_t WokiRamp_QuaternionToSensorRollPitch(const IMU_Data_t *imu,
-		float *roll_deg, float *pitch_deg)
-{
-	float x;
-	float y;
-	float z;
-	float w;
-	float norm_sq;
-	float inverse_norm;
-	float sin_roll;
-	float cos_roll;
-	float sin_pitch;
-
-	if (imu == NULL || roll_deg == NULL || pitch_deg == NULL) {
-		return 0U;
-	}
-
-	x = imu->quaternion_x;
-	y = imu->quaternion_y;
-	z = imu->quaternion_z;
-	w = imu->quaternion_w;
-	norm_sq = x * x + y * y + z * z + w * w;
-
-	if (!isfinite(norm_sq) || norm_sq < WOKI_RAMP_QUATERNION_MIN_NORM_SQ) {
-		return 0U;
-	}
-
-	inverse_norm = 1.0f / sqrtf(norm_sq);
-	x *= inverse_norm;
-	y *= inverse_norm;
-	z *= inverse_norm;
-	w *= inverse_norm;
-
-	sin_roll = 2.0f * (w * x + y * z);
-	cos_roll = 1.0f - 2.0f * (x * x + y * y);
-	*roll_deg = atan2f(sin_roll, cos_roll) * WOKI_RAMP_RAD_TO_DEG;
-
-	sin_pitch = 2.0f * (w * y - z * x);
-	if (sin_pitch > 1.0f) {
-		sin_pitch = 1.0f;
-	} else if (sin_pitch < -1.0f) {
-		sin_pitch = -1.0f;
-	}
-	*pitch_deg = asinf(sin_pitch) * WOKI_RAMP_RAD_TO_DEG;
-
-	return (isfinite(*roll_deg) && isfinite(*pitch_deg)) ? 1U : 0U;
-}
-
+// IMU에서 계산한 센서 자세각 사용, 경사로 부호·영점 보정은 유지
 static uint8_t WokiRamp_GetSensorRollPitch(const IMU_Data_t *imu,
 		float *roll_deg, float *pitch_deg, uint8_t *quaternion_used)
 {
@@ -133,21 +84,13 @@ static uint8_t WokiRamp_GetSensorRollPitch(const IMU_Data_t *imu,
 		return 0U;
 	}
 
-	if (imu->quaternion_valid != 0U) {
-		if (!WokiRamp_QuaternionToSensorRollPitch(imu, roll_deg, pitch_deg)) {
-			return 0U;
-		}
-		*quaternion_used = 1U;
-		return 1U;
-	}
-
 	if (!isfinite(imu->roll) || !isfinite(imu->pitch)) {
 		return 0U;
 	}
 
 	*roll_deg = imu->roll;
 	*pitch_deg = imu->pitch;
-	*quaternion_used = 0U;
+	*quaternion_used = imu->quaternion_valid != 0U ? 1U : 0U;
 	return 1U;
 }
 
@@ -418,6 +361,7 @@ uint8_t WokiRampControl_IsDriveReady(void)
 #if WOKI_RAMP_ENABLE_ACTUATOR_WRITES
     const uint32_t now = HAL_GetTick();
     return woki_ramp_status.enabled && woki_ramp_status.has_written_goal
+            && dxl_knee_position_is_ready()
             && woki_ramp_motion.phase == WOKI_RAMP_MOTION_ACTIVE
             && woki_ramp_motion.drive_ready && !user_stop_flag
             && woki_ramp_imu_map_confirmed
@@ -496,11 +440,11 @@ static void WokiRamp_UpdateMotion(void)
 {
 #if WOKI_RAMP_ENABLE_ACTUATOR_WRITES
     WokiRampMotionFrame f = WokiRamp_MakeFrame();
-    uint32_t target[12];
+    int32_t target[12];
     if (woki_ramp_motion.phase == WOKI_RAMP_MOTION_OFF
             || woki_ramp_motion.phase == WOKI_RAMP_MOTION_LOCKED) {
         if (!WokiRampMotion_ConfigValid(&woki_ramp_safety_config)
-                || !woki_ramp_imu_map_confirmed) {
+                || !woki_ramp_imu_map_confirmed || !dxl_knee_position_is_ready()) {
             woki_ramp_motion.phase = WOKI_RAMP_MOTION_LOCKED;
             woki_ramp_motion.fault = WOKI_RAMP_FAULT_NOT_VERIFIED;
         } else {

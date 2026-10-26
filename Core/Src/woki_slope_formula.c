@@ -10,6 +10,9 @@
 // 종경사 최대 보정각
 #define WOKI_LONGITUDINAL_COMMAND_MAX_DEG 10.5f
 
+// PITCH 앞뒤 보정 최대각
+#define WOKI_PITCH_DELTA_MAX_DEG 15.0f
+
 #define WOKI_DEG_TO_RAD (0.01745329251994329577f)
 #define WOKI_RAD_TO_DEG (57.29577951308232088f)
 
@@ -207,8 +210,9 @@ uint8_t WokiSlope_Compute(const WokiSlopeInput *input, WokiSlopeOutput *output)
     output->longitudinal_clipped =
             (fabsf(longitudinal_clamped - output->longitudinal_raw_deg) > 1.0e-6f) ? 1U : 0U;
     output->longitudinal_command_deg = longitudinal_clamped;
-    output->pitch_delta_deg = WokiSlope_LongitudinalDeltaDeg(
-            longitudinal_clamped);
+    output->pitch_delta_deg = WokiSlope_Clamp(
+            WokiSlope_LongitudinalDeltaDeg(longitudinal_clamped),
+            0.0f, WOKI_PITCH_DELTA_MAX_DEG);
 
     output->hip_pitch_target_deg[WOKI_SLOPE_FL] =
             WOKI_SLOPE_COMMON_PITCH_DEG + output->pitch_delta_deg;

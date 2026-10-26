@@ -56,8 +56,8 @@ typedef struct {
 	uint8_t raw_target_valid;
 	uint8_t output_gate_enabled;
 	uint8_t has_written_goal;
-	uint32_t formula_target_raw[12];
-	uint32_t commanded_target_raw[12];
+	int32_t formula_target_raw[12];
+	int32_t commanded_target_raw[12];
 	uint32_t tracking_error_raw[12];
 	uint32_t max_tracking_error_raw[12];
 	uint32_t last_write_ms;

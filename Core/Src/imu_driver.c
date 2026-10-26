@@ -35,6 +35,12 @@ static uint8_t proc_buf[IMU_RX_BUF_SIZE];
 // 현재 IMU 데이터
 static IMU_Data_t imu_data = { 0 };
 
+// 새 Quaternion 수신 시 계산한 자세각 저장
+static float imu_euler_roll;
+static float imu_euler_pitch;
+static float imu_euler_yaw;
+static uint8_t imu_euler_valid;
+
 // 수신 완료 플래그
 static volatile uint8_t data_ready = 0;
 
@@ -47,6 +53,7 @@ static uint32_t parse_error_count = 0;
 // IMU 문자열의 실수 데이터 파싱
 static uint8_t IMU_Parse_Frame(const char *buf, float *values,
 		uint8_t *value_count);
+static uint8_t IMU_UpdateEulerView(IMU_Data_t *data);
 
 // IMU 초기화 (UART 핸들 등록)
 void IMU_Init(UART_HandleTypeDef *huart) {
@@ -160,6 +167,15 @@ void IMU_Process_Data(void) {
 	imu_data.valid = 1U;
 	imu_data.updated = 1U;
 
+	// 같은 센서값을 조회할 때 자세각을 다시 계산하지 않음
+	if (imu_data.quaternion_valid) {
+		IMU_Data_t euler_view = imu_data;
+		imu_euler_valid = IMU_UpdateEulerView(&euler_view);
+		imu_euler_roll = euler_view.roll;
+		imu_euler_pitch = euler_view.pitch;
+		imu_euler_yaw = euler_view.yaw;
+	}
+
 	// 정상 데이터 수신·해석 후 통신 오류 해제
 	receive_error = 0U;
 
@@ -195,8 +211,14 @@ static uint8_t IMU_UpdateEulerView(IMU_Data_t *data)
 IMU_Data_t IMU_Get_Latest_Data(void) {
 	IMU_Data_t data = imu_data;
 
-	if (data.quaternion_valid && !IMU_UpdateEulerView(&data))
-		data.valid = 0U;
+	// 저장된 자세각 사용, 원본 Quaternion과 유효 시간 검사 유지
+	if (data.quaternion_valid) {
+		data.roll = imu_euler_roll;
+		data.pitch = imu_euler_pitch;
+		data.yaw = imu_euler_yaw;
+		if (!imu_euler_valid)
+			data.valid = 0U;
+	}
 
 	if (receive_error)
 		data.valid = 0;

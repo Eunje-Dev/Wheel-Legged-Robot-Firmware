@@ -28,6 +28,7 @@
 #include "imu_driver.h"
 #include "robot_motion.h"
 #include "jetson_comm.h"
+#include "woki_power_guard.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -106,54 +107,20 @@ int main(void)
 
 	Robot_Motion_Init(); // 로봇 동작 상태 초기화
 	Jetson_Comm_Init(&huart3); // Jetson VCP 통신 초기화
-
-	uint8_t leg_ids[12];     // 12개 다리 모터 ID 배열
-	uint8_t srl_values[12];  // 각 모터의 SRL 설정값 배열
-
-	for (int i = 1; i <= 4; i++) {
-		leg_ids[3 * (i - 1)] = legs[i].roll;
-		srl_values[3 * (i - 1)] = 1;
-
-		leg_ids[3 * (i - 1) + 1] = legs[i].pitch;
-		srl_values[3 * (i - 1) + 1] = 1;
-
-		leg_ids[3 * (i - 1) + 2] = legs[i].knee;
-		srl_values[3 * (i - 1) + 2] = 1;
-	}
-
-	// 다리 모터 응답 레벨 설정 (SRL = 1)
-	dxl_sync_write_1byte(leg_ids, srl_values, 12, DXL_2_Status_Return_Level);
-	HAL_Delay(50);
-
-	// 다리 모터 위치 제어 PID 및 Goal PWM 설정값
-	const uint16_t position_d_gain = 0;
-	const uint16_t position_i_gain = 0;
-	const uint16_t position_p_gain = 850;
-	const uint16_t goal_pwm = 885;
-
-	// 12개 다리 모터의 위치 제어 PID 및 Goal PWM 설정
-	for (int i = 0; i < 12; i++) {
-		dxl_write_2_0(leg_ids[i], DXL_2_Position_D_Gain, 2,
-				position_d_gain);
-
-		dxl_write_2_0(leg_ids[i], DXL_2_Position_I_Gain, 2,
-				position_i_gain);
-
-		dxl_write_2_0(leg_ids[i], DXL_2_Position_P_Gain, 2,
-				position_p_gain);
-
-		dxl_write_2_0(leg_ids[i], DXL_2_Goal_PWM, 2, goal_pwm);
-	}
-	HAL_Delay(50);
-
-	// 시작 시 Wheel Mode 자세 설정
-	Robot_Set_Wheel_Mode();
+	// 바퀴 정지 후 시작 기준 검사, 통과했을 때만 초기 Wheel 자세로 이동
+	Robot_Wheel_Stop();
+	// 전원 ON 전 Knee 네 개의 실제 누적 위치를 0~4095 구간으로 맞춘 상태에서 시작
+	// 검사 통과 후 현재 위치에서 저속으로 Wheel에 직접 이동, 실제 도착 후 모드 전환
+	if (RobotPower_CheckBootStart()) Robot_Set_Wheel_Mode();
+	Jetson_Comm_DiscardPendingCommands(); // 초기 이동 중 대기한 동작 명령은 재사용하지 않음
+	mode_button_request = 0U; // 초기 Wheel 이동 중 입력은 다음 전환으로 넘기지 않음
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 	while (1) {
 		IMU_Task();
+		RobotPower_Task(); // 기준 잠금·종료 준비 확인, ISR에서는 모터 통신 없음
 		Jetson_Comm_Task();
 		Robot_Ramp_Control_Task();
 		Robot_Walk_Demo_Task();
@@ -162,13 +129,18 @@ int main(void)
 		if (mode_button_request) {
 			mode_button_request = 0;
 			Jetson_Comm_DiscardPendingCommands(); // 버튼 동작 전 대기 중인 명령 폐기
+			if (!RobotPower_MotionAllowed()) {
+				// 잠금 원인은 보존, 주차 중에만 중단 요청으로 처리
+				if (RobotPower_IsParking()) RobotPower_Cancel();
+				continue;
+			}
 
 			if (Robot_Get_Mode() == MODE_WHEEL) {
 				// 첫 번째 입력: Wheel → Leg
 				Robot_Set_Leg_Mode();
 			} else if (Robot_Get_Mode() == MODE_LEG) {
-				// 두 번째 입력: 촬영용 3스텝 시작
-				Robot_Start_Walk_Demo();
+				// 두 번째 입력: Leg → Wheel, 이후 같은 순서로 반복
+				Robot_Set_Wheel_Mode();
 			} else if (Robot_Get_Mode() == MODE_WALK_DEMO) {
 				// 보행 중 입력: 현재 자세 유지
 				Robot_Stop_Walk_Demo();
@@ -265,6 +237,16 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
 
 	if (GPIO_Pin == GPIO_PIN_13) {
 		uint32_t current_tick = HAL_GetTick();
+
+
+		// 주차 중 버튼 입력은 정지 요청만 저장, 위치 유지 시도는 메인에서 수행
+		if (RobotPower_IsParking()) {
+			if ((current_tick - last_button_tick) >= 50U) {
+				user_stop_flag = 1U;
+				last_button_tick = current_tick;
+			}
+			return;
+		}
 
 		// 버튼 채터링 방지
 		if ((current_tick - last_button_tick) >= 300U) {

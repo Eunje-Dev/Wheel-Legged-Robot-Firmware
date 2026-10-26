@@ -47,6 +47,8 @@ enum DxlInst {
 // 통신: UART6 (2Mbps)
 enum Dxl_2_0_Addr {
 	DXL_2_Operating_Mode = 11,      // 운전 모드 (1바이트)
+	DXL_2_Drive_Mode = 10,          // 방향·프로파일 방식 (읽기 확인용)
+	DXL_2_Homing_Offset = 20,       // 전원 인가 기준 확인용, 자동 변경 없음
 	DXL_2_Temperature_Limit = 31,   // 최대 온도 제한 (1바이트)
 	DXL_2_PWM_Limit = 36,           // 최대 PWM 제한 (2바이트)
 	DXL_2_Current_Limit = 38,       // 최대 전류 제한 (2바이트)
@@ -58,6 +60,8 @@ enum Dxl_2_0_Addr {
 	DXL_2_LED = 65,                // LED 제어
 	DXL_2_Status_Return_Level = 68, // 응답레벨
 	DXL_2_Hardware_Error_Status = 70, // 하드웨어 에러 상태
+	DXL_2_Velocity_I_Gain = 76,     // 모드 변경 전후 기존 값 보존
+	DXL_2_Velocity_P_Gain = 78,     // 모드 변경 전후 기존 값 보존
 	DXL_2_Position_D_Gain = 80,     // 위치 제어 D Gain
 	DXL_2_Position_I_Gain = 82,     // 위치 제어 I Gain
 	DXL_2_Position_P_Gain = 84,     // 위치 제어 P Gain
@@ -65,6 +69,7 @@ enum Dxl_2_0_Addr {
 	DXL_2_Feedforward_1st_Gain = 90, // 1차 피드포워드 게인
 	DXL_2_Bus_Watchdog = 98,        // 통신 감시 시간 (1바이트)
 	DXL_2_Goal_PWM = 100,           // 목표 PWM 값
+	DXL_2_Goal_Current = 102,       // 모드 변경 전후 기존 값 보존
 	DXL_2_Profile_Acceleration = 108, // 프로파일 가속도
 	DXL_2_Profile_Velocity = 112,  // 프로파일 속도
 	DXL_2_Goal_Position = 116,     // 목표 위치 (Position Control Mode)
@@ -124,6 +129,24 @@ typedef struct {
 	uint8_t received_count;
 } DXL_Leg_State_t;
 
+// Sync Read 진단 전용 RAM 기록, 제어 패킷·상태 패킷 형식과 별개
+#define DXL_SYNC_DIAG_RX_CAPACITY 320U
+enum DxlSyncDiagnosticEnd {
+	DXL_SYNC_DIAG_NONE = 0, DXL_SYNC_DIAG_NO_DMA,
+	DXL_SYNC_DIAG_DMA_START_FAILED, DXL_SYNC_DIAG_TX_FAILED,
+	DXL_SYNC_DIAG_RECEIVE_END
+};
+typedef struct {
+	uint32_t sequence, timestamp_ms, elapsed_ms;
+	uint32_t uart_error, uart_isr, uart_cr3, uart_rx_state;
+	uint32_t dma_state, dma_error, dma_ndtr;
+	uint16_t valid_mask, received_length, parse_index, copied_length;
+	uint8_t received_count, end_reason, dma_start_status, tx_status;
+	uint8_t uart_available, dma_available;
+	// 부분 수신 원인 확인용 원본 바이트, copied_length만 유효
+	uint8_t rx_bytes[DXL_SYNC_DIAG_RX_CAPACITY];
+} DXL_Sync_Read_Diagnostics_t;
+
 // 다리 관절 모터 ID 매핑 테이블 (Protocol 2.0, MX 계열)
 extern LegMotors legs[5];
 
@@ -169,6 +192,11 @@ uint16_t clc_speed_1(int16_t wheel_speed); // AX 모터 속도값 변환
 void dxl_write_1_0(uint8_t id, uint8_t addr, uint8_t data_len, uint16_t data);
 void dxl_write_2_0(uint8_t id, uint16_t addr, uint8_t data_len, uint32_t data);
 
+// 시작 검사·프로파일 복원용 단일 모터 설정, 응답 없는 Sync Write 후 호출 측에서 Read 확인
+// PID·Goal PWM·Profile만 허용, 목표 위치·토크·모드·영점 변경에는 사용 불가
+HAL_StatusTypeDef dxl_sync_write_config_2_0(uint8_t id, uint16_t addr,
+        uint8_t data_len, uint32_t data);
+
 // Protocol 2.0 Read 통신 실패 단계
 enum DxlReadFailStage {
 	DXL_READ_FAIL_NONE = 0,
@@ -206,6 +234,9 @@ uint8_t dxl_read_2_0(uint8_t id, uint16_t addr, uint16_t data_len,
 // 12개 다리 모터 현재 상태 Sync Read
 uint16_t dxl_sync_read_leg_state(DXL_Leg_State_t *state);
 
+// 최근 실제 Sync Read의 진단 복사만 수행, 모터 명령·추가 조회 없음
+void dxl_get_last_sync_read_diagnostics(DXL_Sync_Read_Diagnostics_t *diagnostics);
+
 // 메인 루프에서 최근 모터 조회 결과 재사용
 // 조회 시각·실패·부분 수신 상태 유지, 유효 시간 초과 시 재조회
 uint16_t dxl_get_recent_leg_state(DXL_Leg_State_t *state, uint32_t max_age_ms);
@@ -229,9 +260,46 @@ void dxl_sync_write_1byte(uint8_t *ids, uint8_t *values, uint8_t count,
 void dxl_sync_write_4byte(uint8_t *ids, uint32_t *values, uint8_t count,
 		uint16_t addr);
 
-// 경사로 목표 위치 검사·전송, 모터 응답 확인과 별도
+// KNEE 영점·시작 자세 확인 후 확장 모드 조회, 목표 위치·EEPROM 쓰기 없음
+enum DxlKneePositionStatus {
+    DXL_KNEE_POSITION_LOCKED = 0,
+    DXL_KNEE_POSITION_READY,
+    DXL_KNEE_POSITION_REFERENCE_ERROR,
+    DXL_KNEE_POSITION_COMM_ERROR,
+    DXL_KNEE_POSITION_MODE_ERROR,
+    DXL_KNEE_POSITION_STOPPED,
+    DXL_KNEE_POSITION_PROFILE_MODE_ERROR
+};
+extern volatile uint8_t dxl_knee_position_status;
+uint8_t dxl_prepare_knee_extended_position(void);
+uint8_t dxl_knee_position_is_ready(void);
+
+// 명시적인 설정 명령 전용, 영점과 무관하게 모드 4 설정 후 토크 OFF 유지
+// 로봇 지지·MODE_NONE·상태 스트리밍 정지 확인 후 호출, 부팅 자동 호출 금지
+enum DxlKneeModeConfigStage {
+    DXL_KNEE_CONFIG_IDLE = 0,
+    DXL_KNEE_CONFIG_SNAPSHOT,
+    DXL_KNEE_CONFIG_TORQUE_OFF,
+    DXL_KNEE_CONFIG_MODE,
+    DXL_KNEE_CONFIG_RESTORE,
+    DXL_KNEE_CONFIG_VERIFY,
+    DXL_KNEE_CONFIG_COMPLETE
+};
+typedef struct {
+    uint8_t mode_mask;
+    uint8_t torque_off_mask;
+    uint8_t restored_mask;
+    uint8_t failed_id;
+    uint8_t stage;
+    uint8_t device_error;
+    uint8_t read_fail_stage;
+    uint8_t stopped;
+} DXL_Knee_Mode_Config_Result_t;
+uint8_t dxl_configure_knee_extended_mode(DXL_Knee_Mode_Config_Result_t *result);
+
+// 부호 있는 관절 목표 위치 검사·전송, 모터 응답 확인과 별도
 uint8_t dxl_sync_write_goal_positions_checked(const uint8_t *ids,
-        const uint32_t *values, uint8_t count);
+        const int32_t *values, uint8_t count);
 
 // Dynamixel 패킷 전송 함수 (USART1 바퀴, USART6 다리)
 HAL_StatusTypeDef uart_transmit_packet(UART_HandleTypeDef *huart,
